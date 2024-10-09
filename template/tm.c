@@ -8,67 +8,186 @@
  *
  * @section DESCRIPTION
  *
- * Implementation of your own transaction manager.
- * You can completely rewrite this file (and create more files) as you wish.
- * Only the interface (i.e. exported symbols and semantic) must be preserved.
+ * Implementation of the transaction manager using dual-versioned memory.
 **/
 
-// Requested features
-#define _GNU_SOURCE
-#define _POSIX_C_SOURCE   200809L
-#ifdef __STDC_NO_ATOMICS__
-    #error Current C11 compiler does not support atomic operations
-#endif
-
-// External headers
-
-// Internal headers
-#include <tm.h>
-
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <pthread.h>
+#include "tm.h"
 #include "macros.h"
 
-/** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
+// Batcher data with synchronization primitives
+typedef struct blocked_thread_node {
+    pthread_t thread;
+    struct blocked_thread_node* next;
+} blocked_thread_node_t;
+
+typedef struct {
+    size_t epoch;                       // Current epoch
+    size_t remaining;                   // Remaining transactions in the current epoch
+    blocked_thread_node_t* blocked_head; // Head of the blocked threads list
+    size_t blocked_count;               // Number of blocked threads
+    pthread_mutex_t batcher_mutex;      // Mutex to protect batcher data
+    pthread_cond_t batcher_cond_wake_up;      // Condition variable to wake up threads that should be unblocked
+    pthread_cond_t batcher_cond_enter;        // Condition variable to wake up threads that should enter
+    bool wake_up_threads_only;          // Whether to wake up threads only
+} batcher_data;
+
+// Dual segment structure without redundant size field
+typedef struct dual_segment {
+    struct dual_segment* prev;       // Pointer to the previous dual segment
+    struct dual_segment* next;       // Pointer to the next dual segment
+    void* ro_segment;                // Pointer to the read-only version of the segment
+    void* rw_segment;                // Pointer to the read-write version of the segment
+    bool written_while_epoch;        // Whether the segment was written during the current epoch
+    long access_set;                 // Access set of the segment, if one => pointer of the transaction object, if none => -1, if multiple => -2
+    bool can_be_freed;               // Whether the segment can be freed (only the first segment cannot be freed)
+    pthread_mutex_t segment_mutex;   // Mutex to protect the segment
+} dual_segment_t;
+
+// Shared memory region structure
+struct region {
+    dual_segment_t* head;             // Head of the linked list of dual segments
+    size_t segment_count;             // Number of segments
+    size_t size;                      // Size of one segment in bytes
+    size_t align;                     // Global alignment for the shared memory
+    batcher_data* batcher;             // Batcher data for epoch management
+};
+
+// Transaction structure with enhanced metadata
+typedef struct accessed_segment {
+    dual_segment_t* segment;
+    struct accessed_segment* next;
+} accessed_segment_t;
+
+struct transaction {
+    bool is_ro;                         // Whether the transaction is read-only
+};
+
+/** Create a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
  * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
 **/
-shared_t tm_create(size_t unused(size), size_t unused(align)) {
-    // TODO: tm_create(size_t, size_t)
-    return invalid_shared;
+shared_t tm_create(size_t size, size_t align) {
+    // Verifications
+    if (size == 0 || align == 0 || size % align != 0 || (align & (align - 1)) != 0) {
+        return invalid_shared;
+    }
+
+    // Allocate the shared memory region
+    struct region* region = malloc(sizeof(struct region));
+    if (!region) {
+        return invalid_shared;
+    }
+
+    // Assign the region properties
+    region->segment_count = 1;
+    region->size = size;
+    region->align = align;
+    region->head = malloc(sizeof(dual_segment_t));
+    if (!region->head) {
+        free(region);
+        return invalid_shared;
+    }
+
+    // Assign and initialize the first segment properties
+    region->head->prev = NULL;
+    region->head->next = NULL;
+    
+    // Allocate read-only segment
+    if (posix_memalign(&(region->head->ro_segment), align, size) != 0) {
+        free(region->head);
+        free(region);
+        return invalid_shared;
+    }
+    
+    // Allocate read-write segment
+    if (posix_memalign(&(region->head->rw_segment), align, size) != 0) {
+        free(region->head->ro_segment); // Free the read-only segment
+        free(region->head);
+        free(region);
+        return invalid_shared;
+    }
+
+    // Initialize memory
+    memset(region->head->ro_segment, 0, size);
+    memset(region->head->rw_segment, 0, size);
+    
+    // Initialize segment properties
+    region->head->written_while_epoch = false;
+    region->head->access_set = -1;
+    region->head->can_be_freed = false;
+    pthread_mutex_init(&(region->head->segment_mutex), NULL);
+
+    // Assign and initialize the batcher data
+    region->batcher->epoch = 0;
+    region->batcher->remaining = 0;
+    region->batcher->blocked_head = NULL;
+    region->batcher->blocked_count = 0;
+    region->batcher->wake_up_threads_only = false;
+    pthread_mutex_init(&(region->batcher->batcher_mutex), NULL);
+    pthread_cond_init(&(region->batcher->batcher_cond_enter), NULL);
+    pthread_cond_init(&(region->batcher->batcher_cond_wake_up), NULL);
+
+    return (shared_t)region; // Ensure correct return type
 }
 
-/** Destroy (i.e. clean-up + free) a given shared memory region.
+
+/** Destroy a given shared memory region.
  * @param shared Shared memory region to destroy, with no running transaction
 **/
-void tm_destroy(shared_t unused(shared)) {
-    // TODO: tm_destroy(shared_t)
+void tm_destroy(shared_t shared) {
+    struct region* region = (struct region*)shared;
+
+    // Free all segments
+    dual_segment_t* current = region->head;
+    while (current) {
+        dual_segment_t* next = current->next;
+        free(current->ro_segment);
+        free(current->rw_segment);
+        free(current);
+        current = next;
+    }
+
+    // Free the batcher data
+    pthread_mutex_destroy(&(region->batcher->batcher_mutex));
+    free(region->batcher);
+
+    // Free the region
+    free(region);
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
  * @param shared Shared memory region to query
  * @return Start address of the first allocated segment
 **/
-void* tm_start(shared_t unused(shared)) {
-    // TODO: tm_start(shared_t)
-    return NULL;
+void* tm_start(shared_t shared) {
+    // The first segment is always allocated, and is at the end of the linked list
+    struct region* region = (struct region*)shared;
+    return region->head;
+
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
  * @param shared Shared memory region to query
  * @return First allocated segment size
 **/
-size_t tm_size(shared_t unused(shared)) {
-    // TODO: tm_size(shared_t)
-    return 0;
+size_t tm_size(shared_t shared) {
+    struct region* region = (struct region*)shared;
+    return region->size;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
  * @param shared Shared memory region to query
  * @return Alignment used globally
 **/
-size_t tm_align(shared_t unused(shared)) {
-    // TODO: tm_align(shared_t)
-    return 0;
+size_t tm_align(shared_t shared) {
+    struct region* region = (struct region*)shared;
+    return region->align;
 }
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
@@ -76,9 +195,74 @@ size_t tm_align(shared_t unused(shared)) {
  * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
-tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
-    // TODO: tm_begin(shared_t)
-    return invalid_tx;
+tx_t tm_begin(shared_t shared, bool is_ro) {
+    struct region* region = (struct region*)shared;
+
+    // Create a new transaction
+    struct transaction* tx = malloc(sizeof(struct transaction));
+    if (!tx) {
+        return invalid_tx;
+    }
+
+    // Assign transaction properties
+    tx->is_ro = is_ro;
+
+    // Enter the batcher
+    batcher_data* batcher = region->batcher;
+    pthread_mutex_lock(&(batcher->batcher_mutex));
+    while (batcher->wake_up_threads_only) {
+        pthread_cond_broadcast(&(batcher->batcher_cond_enter));
+    }
+    if (batcher->remaining == 0) {
+        // First thread entering, no one is blocked
+        batcher->remaining = 1;
+    } else {
+        // Block this thread
+        blocked_thread_node_t* new_node = (blocked_thread_node_t*)malloc(sizeof(blocked_thread_node_t));
+        if (!new_node) {
+            free(tx);
+            pthread_mutex_unlock(&(batcher->batcher_mutex));
+            return invalid_tx;
+        }
+        new_node->thread = pthread_self();
+        new_node->next = batcher->blocked_head;
+        batcher->blocked_head = new_node;
+
+        // Increment the count of blocked threads
+        batcher->blocked_count++;
+
+        // Wait until "woken up"
+        while (batcher->remaining != 0) {
+            pthread_cond_wait(&(batcher->batcher_cond_wake_up), &(batcher->batcher_mutex));
+        }
+
+        // Remove the thread from the blocked list
+        blocked_thread_node_t* current = batcher->blocked_head;
+        blocked_thread_node_t* previous = NULL;
+        while (current) {
+            if (current->thread == pthread_self()) {
+                if (previous) {
+                    previous->next = current->next;
+                } else {
+                    batcher->blocked_head = current->next;
+                }
+                free(current);
+                batcher->blocked_count--;
+                batcher->remaining++;
+                if (batcher->blocked_count == 0) {
+                    batcher->wake_up_threads_only = false;
+                    pthread_cond_broadcast(&(batcher->batcher_cond_enter));
+                }
+                break;
+            }
+            previous = current;
+            current = current->next;
+        }
+    }
+
+    pthread_mutex_unlock(&(batcher->batcher_mutex));
+
+    return (tx_t)tx; // Ensure correct return type
 }
 
 /** [thread-safe] End the given transaction.
@@ -86,9 +270,41 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
 **/
-bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
-    // TODO: tm_end(shared_t, tx_t)
-    return false;
+bool tm_end(shared_t shared, tx_t tx) {
+    struct region* region = (struct region*)shared;
+    struct transaction* transaction = (struct transaction*)tx;
+
+    // Leave the batcher
+    batcher_data* batcher = region->batcher;
+    pthread_mutex_lock(&(batcher->batcher_mutex));
+    batcher->remaining -= 1;
+    if (batcher->remaining == 0) {
+        // End the epoch
+        batcher->epoch += 1;
+        batcher->wake_up_threads_only = true;
+
+        // Update the segments (swap read-only and read-write segments, update control fields, etc.)
+        dual_segment_t* current = region->head;
+        while (current) {
+            // No need for locks as we no that no other thread is accessing the segments
+            void* temp = current->ro_segment;
+            current->ro_segment = current->rw_segment;
+            current->rw_segment = temp;
+            current->written_while_epoch = false;
+            current->access_set = -1;
+            
+            current = current->next;
+        }
+
+        // Wake up all threads that are blocked
+        pthread_cond_broadcast(&(batcher->batcher_cond_wake_up));
+    }
+    pthread_mutex_unlock(&(batcher->batcher_mutex));
+
+    // Free the transaction
+    free(transaction);
+
+    return true;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -99,10 +315,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_read(shared_t unused(shared), tx_t unused(tx), void const* unused(source), size_t unused(size), void* unused(target)) {
-    // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
-    return false;
-}
+bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {}
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
  * @param shared Shared memory region associated with the transaction
@@ -112,10 +325,7 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const* unused(source
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* unused(source), size_t unused(size), void* unused(target)) {
-    // TODO: tm_write(shared_t, tx_t, void const*, size_t, void*)
-    return false;
-}
+bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {}
 
 /** [thread-safe] Memory allocation in the given transaction.
  * @param shared Shared memory region associated with the transaction
@@ -124,10 +334,7 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* unused(sourc
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), void** unused(target)) {
-    // TODO: tm_alloc(shared_t, tx_t, size_t, void**)
-    return abort_alloc;
-}
+alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {}
 
 /** [thread-safe] Memory freeing in the given transaction.
  * @param shared Shared memory region associated with the transaction
@@ -135,7 +342,4 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
 **/
-bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) {
-    // TODO: tm_free(shared_t, tx_t, void*)
-    return false;
-}
+bool tm_free(shared_t shared, tx_t tx, void* target) {}
