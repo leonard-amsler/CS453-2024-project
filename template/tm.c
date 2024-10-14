@@ -214,7 +214,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
         pthread_cond_broadcast(&(batcher->batcher_cond_enter));
     }
     if (batcher->remaining == 0) {
-        // First thread entering, no one is blocked
+        // First thread entering, no one is blocked, new epoch starting
         batcher->remaining = 1;
     } else {
         // Block this thread
