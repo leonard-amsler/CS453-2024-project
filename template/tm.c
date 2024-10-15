@@ -16,7 +16,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <pthread.h>
-#include "tm.h"
+#include <tm.h>
 #include "macros.h"
 
 // Batcher data with synchronization primitives
@@ -40,8 +40,8 @@ typedef struct {
 typedef struct dual_segment {
     struct dual_segment* prev;       // Pointer to the previous dual segment
     struct dual_segment* next;       // Pointer to the next dual segment
-    void* ro_segment;                // Pointer to the read-only version of the segment
-    void* rw_segment;                // Pointer to the read-write version of the segment
+    uint8_t* ro_segment;                // Pointer to the read-only version of the segment
+    uint8_t* rw_segment;                // Pointer to the read-write version of the segment
     bool written_while_epoch;        // Whether the segment was written during the current epoch
     long access_set;                 // Access set of the segment, if one => pointer of the transaction object, if none => -1, if multiple => -2
     bool can_be_freed;               // Whether the segment can be freed (only the first segment cannot be freed)
@@ -73,14 +73,17 @@ struct transaction {
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
 **/
 shared_t tm_create(size_t size, size_t align) {
+
     // Verifications
     if (size == 0 || align == 0 || size % align != 0 || (align & (align - 1)) != 0) {
+        printf("Invalid size or alignment\n");
         return invalid_shared;
     }
 
     // Allocate the shared memory region
     struct region* region = malloc(sizeof(struct region));
     if (!region) {
+        printf("Memory allocation failed for the region\n");
         return invalid_shared;
     }
 
@@ -90,6 +93,7 @@ shared_t tm_create(size_t size, size_t align) {
     region->align = align;
     region->head = malloc(sizeof(dual_segment_t));
     if (!region->head) {
+        printf("Memory allocation failed for the head\n");
         free(region);
         return invalid_shared;
     }
@@ -100,6 +104,7 @@ shared_t tm_create(size_t size, size_t align) {
     
     // Allocate read-only segment
     if (posix_memalign(&(region->head->ro_segment), align, size) != 0) {
+        printf("Memory allocation failed for the read-only segment\n");
         free(region->head);
         free(region);
         return invalid_shared;
@@ -107,6 +112,7 @@ shared_t tm_create(size_t size, size_t align) {
     
     // Allocate read-write segment
     if (posix_memalign(&(region->head->rw_segment), align, size) != 0) {
+        printf("Memory allocation failed for the read-write segment\n");
         free(region->head->ro_segment); // Free the read-only segment
         free(region->head);
         free(region);
@@ -124,6 +130,15 @@ shared_t tm_create(size_t size, size_t align) {
     pthread_mutex_init(&(region->head->segment_mutex), NULL);
 
     // Assign and initialize the batcher data
+    region->batcher = malloc(sizeof(batcher_data));
+    if (!region->batcher) {
+        printf("Memory allocation failed for the batcher\n");
+        free(region->head->ro_segment); // Free the read-only segment
+        free(region->head->rw_segment); // Free the read-write segment
+        free(region->head); // Free the head
+        free(region); // Free the region
+        return invalid_shared;
+    }
     region->batcher->epoch = 0;
     region->batcher->remaining = 0;
     region->batcher->blocked_head = NULL;
@@ -215,8 +230,10 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     }
     if (batcher->remaining == 0) {
         // First thread entering, no one is blocked
+        printf("%ld: First thread entering\n", pthread_self());
         batcher->remaining = 1;
     } else {
+        printf("%ld: Blocked at %ld\n", pthread_self(), time(NULL));
         // Block this thread
         blocked_thread_node_t* new_node = (blocked_thread_node_t*)malloc(sizeof(blocked_thread_node_t));
         if (!new_node) {
@@ -224,6 +241,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
             pthread_mutex_unlock(&(batcher->batcher_mutex));
             return invalid_tx;
         }
+
         new_node->thread = pthread_self();
         new_node->next = batcher->blocked_head;
         batcher->blocked_head = new_node;
@@ -232,15 +250,17 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
         batcher->blocked_count++;
 
         // Wait until "woken up"
-        while (batcher->remaining != 0) {
+        while (!batcher->wake_up_threads_only) {
             pthread_cond_wait(&(batcher->batcher_cond_wake_up), &(batcher->batcher_mutex));
         }
+        printf("%ld: Unblocked at %ld\n", pthread_self(), time(NULL));
 
         // Remove the thread from the blocked list
         blocked_thread_node_t* current = batcher->blocked_head;
         blocked_thread_node_t* previous = NULL;
         while (current) {
             if (current->thread == pthread_self()) {
+                printf("%ld: Removing thread from the blocked list\n", pthread_self());
                 if (previous) {
                     previous->next = current->next;
                 } else {
@@ -250,6 +270,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
                 batcher->blocked_count--;
                 batcher->remaining++;
                 if (batcher->blocked_count == 0) {
+                    printf("%ld: No more blocked threads\n", pthread_self());
                     batcher->wake_up_threads_only = false;
                     pthread_cond_broadcast(&(batcher->batcher_cond_enter));
                 }
@@ -261,6 +282,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     }
 
     pthread_mutex_unlock(&(batcher->batcher_mutex));
+    printf("%ld: Release the mutex at %ld\n", pthread_self(), time(NULL));
 
     return (tx_t)tx; // Ensure correct return type
 }
@@ -279,9 +301,14 @@ bool tm_end(shared_t shared, tx_t tx) {
     pthread_mutex_lock(&(batcher->batcher_mutex));
     batcher->remaining -= 1;
     if (batcher->remaining == 0) {
+        printf("%ld: Last thread leaving!\n", pthread_self());
+
         // End the epoch
         batcher->epoch += 1;
         batcher->wake_up_threads_only = true;
+
+        printf("%ld: New epoch: %ld\n", pthread_self(), batcher->epoch);
+
 
         // Update the segments (swap read-only and read-write segments, update control fields, etc.)
         dual_segment_t* current = region->head;
@@ -298,8 +325,10 @@ bool tm_end(shared_t shared, tx_t tx) {
 
         // Wake up all threads that are blocked
         pthread_cond_broadcast(&(batcher->batcher_cond_wake_up));
+        printf("%ld: Broadcasted wake up\n", pthread_self());
     }
     pthread_mutex_unlock(&(batcher->batcher_mutex));
+    printf("%ld: Release the mutex at %ld\n", pthread_self(), time(NULL));
 
     // Free the transaction
     free(transaction);
@@ -315,7 +344,9 @@ bool tm_end(shared_t shared, tx_t tx) {
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {}
+bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
+    return false;
+}
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
  * @param shared Shared memory region associated with the transaction
@@ -325,7 +356,9 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {}
+bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
+    return false;
+}
 
 /** [thread-safe] Memory allocation in the given transaction.
  * @param shared Shared memory region associated with the transaction
@@ -334,7 +367,9 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {}
+alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
+    return abort_alloc;
+}
 
 /** [thread-safe] Memory freeing in the given transaction.
  * @param shared Shared memory region associated with the transaction
@@ -342,4 +377,6 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {}
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
 **/
-bool tm_free(shared_t shared, tx_t tx, void* target) {}
+bool tm_free(shared_t shared, tx_t tx, void* target) {
+    return false;
+}
