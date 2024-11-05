@@ -21,50 +21,49 @@
 
 // Batcher data with synchronization primitives
 typedef struct blocked_thread_node {
-    pthread_t thread;
-    struct blocked_thread_node* next;
+    pthread_t thread;                       // Thread identifier
+    struct blocked_thread_node* next;       // Next node in the list
 } blocked_thread_node_t;
 
+// Batcher data with synchronization primitives
 typedef struct {
-    size_t epoch;                       // Current epoch
-    size_t remaining;                   // Remaining transactions in the current epoch
-    blocked_thread_node_t* blocked_head; // Head of the blocked threads list
-    size_t blocked_count;               // Number of blocked threads
-    pthread_mutex_t batcher_mutex;      // Mutex to protect batcher data
-    pthread_cond_t batcher_cond_wake_up;      // Condition variable to wake up threads that should be unblocked
-    pthread_cond_t batcher_cond_enter;        // Condition variable to wake up threads that should enter
-    bool wake_up_threads_only;          // Whether to wake up threads only
+    size_t epoch;                           // Current epoch
+    size_t remaining;                       // Remaining transactions in the current epoch
+    blocked_thread_node_t* blocked_head;    // Head of the blocked threads list
+    size_t blocked_count;                   // Number of blocked threads
+    pthread_mutex_t batcher_mutex;          // Mutex to protect batcher data
+    pthread_cond_t batcher_cond_wake_up;    // Condition variable to wake up threads that should be unblocked
+    pthread_cond_t batcher_cond_enter;      // Condition variable to wake up threads that should enter
+    bool wake_up_threads_only;              // Whether to wake up threads only
 } batcher_data;
 
+// Dual segment structure with redundant size field
+typedef struct {
+    bool written_while_epoch;               // Whether the segment was written during the current epoch
+    long access_set;                        // Access set of the segment, if one => pointer of the transaction object, if none => -1, if multiple => -2
+    bool can_be_freed;                      // Whether the segment can be freed (only the first segment cannot be freed)
+    pthread_mutex_t segment_mutex;          // Mutex to protect the segment
+} controls;
+
 // Dual segment structure without redundant size field
-typedef struct dual_segment {
-    struct dual_segment* prev;       // Pointer to the previous dual segment
-    struct dual_segment* next;       // Pointer to the next dual segment
-    uint8_t* ro_segment;                // Pointer to the read-only version of the segment
-    uint8_t* rw_segment;                // Pointer to the read-write version of the segment
-    bool written_while_epoch;        // Whether the segment was written during the current epoch
-    long access_set;                 // Access set of the segment, if one => pointer of the transaction object, if none => -1, if multiple => -2
-    bool can_be_freed;               // Whether the segment can be freed (only the first segment cannot be freed)
-    pthread_mutex_t segment_mutex;   // Mutex to protect the segment
-} dual_segment_t;
+typedef struct {
+    uint8_t* ro_words;                      // Pointer to the next dual segment
+    uint8_t* rw_words;                      // Pointer to the previous dual segment
+    controls* controls;                     // Pointer to the control fields
+    size_t size;                            // Number of words per segment
+} dual_segment;
 
 // Shared memory region structure
-struct region {
-    dual_segment_t* head;             // Head of the linked list of dual segments
-    size_t segment_count;             // Number of segments
-    size_t size;                      // Size of one segment in bytes
-    size_t align;                     // Global alignment for the shared memory
-    batcher_data* batcher;             // Batcher data for epoch management
+typedef struct region {
+    dual_segment* dual_segments;             // Pointer to the first segment
+    size_t segment_count;                   // Number of segments
+    size_t align;                           // Number of bytes per word
+    batcher_data* batcher;                  // Batcher data for epoch management
 };
 
-// Transaction structure with enhanced metadata
-typedef struct accessed_segment {
-    dual_segment_t* segment;
-    struct accessed_segment* next;
-} accessed_segment_t;
-
+// Transaction structure
 struct transaction {
-    bool is_ro;                         // Whether the transaction is read-only
+    bool is_ro;                             // Whether the transaction is read-only
 };
 
 /** Create a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -89,53 +88,63 @@ shared_t tm_create(size_t size, size_t align) {
 
     // Assign the region properties
     region->segment_count = 1;
-    region->size = size;
     region->align = align;
-    region->head = malloc(sizeof(dual_segment_t));
-    if (!region->head) {
-        printf("Memory allocation failed for the head\n");
+    region->dual_segments = malloc(sizeof(dual_segment));
+    if (!region->dual_segments) {
+        printf("Memory allocation failed for the dual segment\n");
         free(region);
         return invalid_shared;
     }
 
     // Assign and initialize the first segment properties
-    region->head->prev = NULL;
-    region->head->next = NULL;
+    region->dual_segments->size = size;
     
     // Allocate read-only segment
-    if (posix_memalign(&(region->head->ro_segment), align, size) != 0) {
+    if (posix_memalign(&(region->dual_segments->ro_words), align, size) != 0) {
         printf("Memory allocation failed for the read-only segment\n");
-        free(region->head);
+        free(region->dual_segments);
         free(region);
         return invalid_shared;
     }
     
     // Allocate read-write segment
-    if (posix_memalign(&(region->head->rw_segment), align, size) != 0) {
+    if (posix_memalign(&(region->dual_segments->rw_words), align, size) != 0) {
         printf("Memory allocation failed for the read-write segment\n");
-        free(region->head->ro_segment); // Free the read-only segment
-        free(region->head);
-        free(region);
+        free(region->dual_segments->ro_words); // Free the read-only segment
+        free(region->dual_segments); // Free the dual segment
+        free(region); // Free the region
         return invalid_shared;
     }
 
     // Initialize memory
-    memset(region->head->ro_segment, 0, size);
-    memset(region->head->rw_segment, 0, size);
+    memset(region->dual_segments->ro_words, 0, size);
+    memset(region->dual_segments->rw_words, 0, size);
     
     // Initialize segment properties
-    region->head->written_while_epoch = false;
-    region->head->access_set = -1;
-    region->head->can_be_freed = false;
-    pthread_mutex_init(&(region->head->segment_mutex), NULL);
+    region->dual_segments->controls = malloc(sizeof(controls));
+    if (!region->dual_segments->controls) {
+        printf("Memory allocation failed for the controls\n");
+        free(region->dual_segments->ro_words); // Free the read-only segment
+        free(region->dual_segments->rw_words); // Free the read-write segment
+        free(region->dual_segments); // Free the dual segment
+        free(region); // Free the region
+        return invalid_shared;
+    }
+
+    // Initialize the control fields
+    region->dual_segments->controls->written_while_epoch = false;
+    region->dual_segments->controls->access_set = -1;
+    region->dual_segments->controls->can_be_freed = false;
+    pthread_mutex_init(&(region->dual_segments->controls->segment_mutex), NULL);
 
     // Assign and initialize the batcher data
     region->batcher = malloc(sizeof(batcher_data));
     if (!region->batcher) {
         printf("Memory allocation failed for the batcher\n");
-        free(region->head->ro_segment); // Free the read-only segment
-        free(region->head->rw_segment); // Free the read-write segment
-        free(region->head); // Free the head
+        free(region->dual_segments->controls); // Free the control fields
+        free(region->dual_segments->ro_words); // Free the read-only segment
+        free(region->dual_segments->rw_words); // Free the read-write segment
+        free(region->dual_segments); // Free the dual segment
         free(region); // Free the region
         return invalid_shared;
     }
@@ -159,17 +168,32 @@ void tm_destroy(shared_t shared) {
     struct region* region = (struct region*)shared;
 
     // Free all segments
-    dual_segment_t* current = region->head;
+    for (size_t i = 0; i < region->segment_count; i++) {
+        dual_segment* seg = &(region->dual_segments[i]);
+        
+        // Free individual segment properties if they were dynamically allocated
+        free(seg->ro_words);
+        free(seg->rw_words);
+        free(seg->controls);
+    }
+
+    // Free the dual segment array
+    free(region->dual_segments);
+
+    // Free the batcher data
+    pthread_mutex_destroy(&region->batcher->batcher_mutex);
+    pthread_cond_destroy(&region->batcher->batcher_cond_wake_up);
+    pthread_cond_destroy(&region->batcher->batcher_cond_enter);
+    
+    // Free the blocked threads list if dynamically allocated
+    blocked_thread_node_t* current = region->batcher->blocked_head;
     while (current) {
-        dual_segment_t* next = current->next;
-        free(current->ro_segment);
-        free(current->rw_segment);
+        blocked_thread_node_t* next = current->next;
         free(current);
         current = next;
     }
 
-    // Free the batcher data
-    pthread_mutex_destroy(&(region->batcher->batcher_mutex));
+    // Free the batcher structure itself
     free(region->batcher);
 
     // Free the region
@@ -183,7 +207,7 @@ void tm_destroy(shared_t shared) {
 void* tm_start(shared_t shared) {
     // The first segment is always allocated, and is at the end of the linked list
     struct region* region = (struct region*)shared;
-    return region->head;
+    return region->dual_segments->ro_words;
 
 }
 
@@ -193,7 +217,7 @@ void* tm_start(shared_t shared) {
 **/
 size_t tm_size(shared_t shared) {
     struct region* region = (struct region*)shared;
-    return region->size;
+    return region->dual_segments->size;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
@@ -230,10 +254,10 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     }
     if (batcher->remaining == 0) {
         // First thread entering, no one is blocked
-        printf("%ld: First thread entering\n", pthread_self());
+        //printf("%ld: First thread entering\n", pthread_self());
         batcher->remaining = 1;
     } else {
-        printf("%ld: Blocked at %ld\n", pthread_self(), time(NULL));
+        //printf("%ld: Blocked at %ld\n", pthread_self(), time(NULL));
         // Block this thread
         blocked_thread_node_t* new_node = (blocked_thread_node_t*)malloc(sizeof(blocked_thread_node_t));
         if (!new_node) {
@@ -253,14 +277,14 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
         while (!batcher->wake_up_threads_only) {
             pthread_cond_wait(&(batcher->batcher_cond_wake_up), &(batcher->batcher_mutex));
         }
-        printf("%ld: Unblocked at %ld\n", pthread_self(), time(NULL));
+        //printf("%ld: Unblocked at %ld\n", pthread_self(), time(NULL));
 
         // Remove the thread from the blocked list
         blocked_thread_node_t* current = batcher->blocked_head;
         blocked_thread_node_t* previous = NULL;
         while (current) {
             if (current->thread == pthread_self()) {
-                printf("%ld: Removing thread from the blocked list\n", pthread_self());
+                //printf("%ld: Removing thread from the blocked list\n", pthread_self());
                 if (previous) {
                     previous->next = current->next;
                 } else {
@@ -270,7 +294,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
                 batcher->blocked_count--;
                 batcher->remaining++;
                 if (batcher->blocked_count == 0) {
-                    printf("%ld: No more blocked threads\n", pthread_self());
+                    //printf("%ld: No more blocked threads\n", pthread_self());
                     batcher->wake_up_threads_only = false;
                     pthread_cond_broadcast(&(batcher->batcher_cond_enter));
                 }
@@ -282,7 +306,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     }
 
     pthread_mutex_unlock(&(batcher->batcher_mutex));
-    printf("%ld: Release the mutex at %ld\n", pthread_self(), time(NULL));
+    //printf("%ld: Release the mutex at %ld\n", pthread_self(), time(NULL));
 
     return (tx_t)tx; // Ensure correct return type
 }
@@ -301,34 +325,33 @@ bool tm_end(shared_t shared, tx_t tx) {
     pthread_mutex_lock(&(batcher->batcher_mutex));
     batcher->remaining -= 1;
     if (batcher->remaining == 0) {
-        printf("%ld: Last thread leaving!\n", pthread_self());
+        //printf("%ld: Last thread leaving!\n", pthread_self());
 
         // End the epoch
         batcher->epoch += 1;
         batcher->wake_up_threads_only = true;
 
-        printf("%ld: New epoch: %ld\n", pthread_self(), batcher->epoch);
+        //printf("%ld: New epoch: %ld\n", pthread_self(), batcher->epoch);
 
 
         // Update the segments (swap read-only and read-write segments, update control fields, etc.)
-        dual_segment_t* current = region->head;
-        while (current) {
+        dual_segment* segments = region->dual_segments;
+        for (size_t i = 0; i < region->segment_count; i++) {
             // No need for locks as we no that no other thread is accessing the segments
-            void* temp = current->ro_segment;
-            current->ro_segment = current->rw_segment;
-            current->rw_segment = temp;
-            current->written_while_epoch = false;
-            current->access_set = -1;
-            
-            current = current->next;
+            dual_segment* current = &(segments[i]);
+            void* temp = current->ro_words;
+            current->ro_words = current->rw_words;
+            current->rw_words = temp;
+            current->controls->written_while_epoch = false;
+            current->controls->access_set = -1;
         }
 
         // Wake up all threads that are blocked
         pthread_cond_broadcast(&(batcher->batcher_cond_wake_up));
-        printf("%ld: Broadcasted wake up\n", pthread_self());
+        //printf("%ld: Broadcasted wake up\n", pthread_self());
     }
     pthread_mutex_unlock(&(batcher->batcher_mutex));
-    printf("%ld: Release the mutex at %ld\n", pthread_self(), time(NULL));
+    //printf("%ld: Release the mutex at %ld\n", pthread_self(), time(NULL));
 
     // Free the transaction
     free(transaction);
