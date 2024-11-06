@@ -19,6 +19,10 @@
 #include <tm.h>
 #include "macros.h"
 
+// Constants for the access set
+static const long ACC_SET_NONE = -1;
+static const long ACC_SET_MULTIPLE = -2;
+
 // Batcher data with synchronization primitives
 typedef struct blocked_thread_node {
     pthread_t thread;                       // Thread identifier
@@ -37,29 +41,30 @@ typedef struct {
     bool wake_up_threads_only;              // Whether to wake up threads only
 } batcher_data;
 
-// Dual segment structure with redundant size field
+// Control structure for each word
 typedef struct {
-    bool written_while_epoch;               // Whether the segment was written during the current epoch
-    long access_set;                        // Access set of the segment, if one => pointer of the transaction object, if none => -1, if multiple => -2
-    bool can_be_freed;                      // Whether the segment can be freed (only the first segment cannot be freed)
-    pthread_mutex_t segment_mutex;          // Mutex to protect the segment
+    bool written_while_epoch;               // Whether the word was written in the current epoch
+    long access_set;                        // Pointer to the transaction object, or special constants (ACC_SET_NONE, ACC_SET_MULTIPLE)
+    pthread_mutex_t word_mutex;             // Mutex to protect the word
 } controls;
 
-// Dual segment structure without redundant size field
-typedef struct {
-    uint8_t* ro_words;                      // Pointer to the next dual segment
-    uint8_t* rw_words;                      // Pointer to the previous dual segment
-    controls* controls;                     // Pointer to the control fields
-    size_t size;                            // Number of words per segment
+// Dual segment structure
+typedef struct dual_segment {
+    uint8_t* ro_words;                      // Read-only copy (array of bytes)
+    uint8_t* rw_words;                      // Writable copy (array of bytes)
+    controls* controls;                     // Control structures per word (array of controls)
+    size_t size;                            // Number of words in a segment
+    bool can_be_freed;                      // Whether the segment can be freed (Only the first segment cannot be freed)
+    struct dual_segment* next;              // Pointer to the next segment
 } dual_segment;
 
 // Shared memory region structure
 typedef struct region {
-    dual_segment* dual_segments;             // Pointer to the first segment
-    size_t segment_count;                   // Number of segments
+    dual_segment* segment_head;             // Pointer to the first segment
     size_t align;                           // Number of bytes per word
     batcher_data* batcher;                  // Batcher data for epoch management
-};
+    pthread_mutex_t segments_mutex;         // Mutex to protect the segments list
+} region;
 
 // Transaction structure
 struct transaction {
@@ -72,8 +77,7 @@ struct transaction {
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
 **/
 shared_t tm_create(size_t size, size_t align) {
-
-    // Verifications
+    // Verify the size and alignment parameters
     if (size == 0 || align == 0 || size % align != 0 || (align & (align - 1)) != 0) {
         printf("Invalid size or alignment\n");
         return invalid_shared;
@@ -86,118 +90,166 @@ shared_t tm_create(size_t size, size_t align) {
         return invalid_shared;
     }
 
-    // Assign the region properties
-    region->segment_count = 1;
+    // Initialize the region properties
+    region->segment_head = NULL;
     region->align = align;
-    region->dual_segments = malloc(sizeof(dual_segment));
-    if (!region->dual_segments) {
+    if (pthread_mutex_init(&(region->segments_mutex), NULL) != 0) {
+        printf("Mutex initialization failed for the segments_mutex\n");
+        free(region);
+        return invalid_shared;
+    }
+
+    // Allocate and initialize the first segment
+    dual_segment* segment = malloc(sizeof(dual_segment));
+    if (!segment) {
         printf("Memory allocation failed for the dual segment\n");
+        pthread_mutex_destroy(&(region->segments_mutex));
         free(region);
         return invalid_shared;
     }
 
-    // Assign and initialize the first segment properties
-    region->dual_segments->size = size;
-    
-    // Allocate read-only segment
-    if (posix_memalign(&(region->dual_segments->ro_words), align, size) != 0) {
+    // Set can_be_freed to false for the first segment
+    segment->can_be_freed = false;
+    segment->next = NULL;
+
+    // Calculate the number of words
+    size_t word_size = align;
+    size_t num_words = size / word_size;
+    segment->size = num_words; // Number of words in the segment
+
+    // Allocate ro_words
+    if (posix_memalign((void**)&(segment->ro_words), align, size) != 0) {
         printf("Memory allocation failed for the read-only segment\n");
-        free(region->dual_segments);
+        free(segment);
+        pthread_mutex_destroy(&(region->segments_mutex));
         free(region);
         return invalid_shared;
     }
-    
-    // Allocate read-write segment
-    if (posix_memalign(&(region->dual_segments->rw_words), align, size) != 0) {
+
+    // Allocate rw_words
+    if (posix_memalign((void**)&(segment->rw_words), align, size) != 0) {
         printf("Memory allocation failed for the read-write segment\n");
-        free(region->dual_segments->ro_words); // Free the read-only segment
-        free(region->dual_segments); // Free the dual segment
-        free(region); // Free the region
+        free(segment->ro_words);
+        free(segment);
+        pthread_mutex_destroy(&(region->segments_mutex));
+        free(region);
         return invalid_shared;
     }
 
-    // Initialize memory
-    memset(region->dual_segments->ro_words, 0, size);
-    memset(region->dual_segments->rw_words, 0, size);
-    
-    // Initialize segment properties
-    region->dual_segments->controls = malloc(sizeof(controls));
-    if (!region->dual_segments->controls) {
+    // Initialize ro_words and rw_words to zero
+    memset(segment->ro_words, 0, size);
+    memset(segment->rw_words, 0, size);
+
+    // Allocate controls array
+    segment->controls = malloc(num_words * sizeof(controls));
+    if (!segment->controls) {
         printf("Memory allocation failed for the controls\n");
-        free(region->dual_segments->ro_words); // Free the read-only segment
-        free(region->dual_segments->rw_words); // Free the read-write segment
-        free(region->dual_segments); // Free the dual segment
-        free(region); // Free the region
+        free(segment->rw_words);
+        free(segment->ro_words);
+        free(segment);
+        pthread_mutex_destroy(&(region->segments_mutex));
+        free(region);
         return invalid_shared;
     }
 
-    // Initialize the control fields
-    region->dual_segments->controls->written_while_epoch = false;
-    region->dual_segments->controls->access_set = -1;
-    region->dual_segments->controls->can_be_freed = false;
-    if(pthread_mutex_init(&(region->dual_segments->controls->segment_mutex), NULL) != 0) {
-        printf("Mutex initialization failed for the segment\n");
-        free(region->dual_segments->controls); // Free the control fields
-        free(region->dual_segments->ro_words); // Free the read-only segment
-        free(region->dual_segments->rw_words); // Free the read-write segment
-        free(region->dual_segments); // Free the dual segment
-        free(region); // Free the region
-        return invalid_shared;
+    // Initialize the controls array
+    for (size_t i = 0; i < num_words; i++) {
+        segment->controls[i].written_while_epoch = false;
+        segment->controls[i].access_set = ACC_SET_NONE;
+        if (pthread_mutex_init(&(segment->controls[i].word_mutex), NULL) != 0) {
+            printf("Mutex initialization failed for word_mutex\n");
+            // Clean up resources allocated so far
+            for (size_t j = 0; j < i; j++) {
+                pthread_mutex_destroy(&(segment->controls[j].word_mutex));
+            }
+            free(segment->controls);
+            free(segment->rw_words);
+            free(segment->ro_words);
+            free(segment);
+            pthread_mutex_destroy(&(region->segments_mutex));
+            free(region);
+            return invalid_shared;
+        }
     }
 
-    // Assign and initialize the batcher data
+    // Add the segment to the region's segment list
+    region->segment_head = segment;
+
+    // Allocate and initialize the batcher data
     region->batcher = malloc(sizeof(batcher_data));
     if (!region->batcher) {
         printf("Memory allocation failed for the batcher\n");
-        free(region->dual_segments->controls); // Free the control fields
-        free(region->dual_segments->ro_words); // Free the read-only segment
-        free(region->dual_segments->rw_words); // Free the read-write segment
-        free(region->dual_segments); // Free the dual segment
-        free(region); // Free the region
+        // Clean up resources
+        for (size_t i = 0; i < num_words; i++) {
+            pthread_mutex_destroy(&(segment->controls[i].word_mutex));
+        }
+        free(segment->controls);
+        free(segment->rw_words);
+        free(segment->ro_words);
+        free(segment);
+        pthread_mutex_destroy(&(region->segments_mutex));
+        free(region);
         return invalid_shared;
     }
+
     region->batcher->epoch = 0;
     region->batcher->remaining = 0;
     region->batcher->blocked_head = NULL;
     region->batcher->blocked_count = 0;
     region->batcher->wake_up_threads_only = false;
-    if(pthread_mutex_init(&(region->batcher->batcher_mutex), NULL) != 0) {
-        printf("Mutex initialization failed for the batcher\n");
-        free(region->batcher); // Free the batcher
-        free(region->dual_segments->controls); // Free the control fields
-        free(region->dual_segments->ro_words); // Free the read-only segment
-        free(region->dual_segments->rw_words); // Free the read-write segment
-        free(region->dual_segments); // Free the dual segment
-        free(region); // Free the region
+
+    if (pthread_mutex_init(&(region->batcher->batcher_mutex), NULL) != 0) {
+        printf("Mutex initialization failed for batcher_mutex\n");
+        free(region->batcher);
+        // Clean up resources
+        for (size_t i = 0; i < num_words; i++) {
+            pthread_mutex_destroy(&(segment->controls[i].word_mutex));
+        }
+        free(segment->controls);
+        free(segment->rw_words);
+        free(segment->ro_words);
+        free(segment);
+        pthread_mutex_destroy(&(region->segments_mutex));
+        free(region);
         return invalid_shared;
     }
 
     if (pthread_cond_init(&(region->batcher->batcher_cond_enter), NULL) != 0) {
-        printf("Condition variable initialization failed for the batcher\n");
+        printf("Condition variable initialization failed for batcher_cond_enter\n");
         pthread_mutex_destroy(&(region->batcher->batcher_mutex));
-        free(region->batcher); // Free the batcher
-        free(region->dual_segments->controls); // Free the control fields
-        free(region->dual_segments->ro_words); // Free the read-only segment
-        free(region->dual_segments->rw_words); // Free the read-write segment
-        free(region->dual_segments); // Free the dual segment
-        free(region); // Free the region
-        return invalid_shared;
-    }
-    
-    if(pthread_cond_init(&(region->batcher->batcher_cond_wake_up), NULL) != 0) {
-        printf("Condition variable initialization failed for the batcher\n");
-        pthread_mutex_destroy(&(region->batcher->batcher_mutex));
-        pthread_cond_destroy(&(region->batcher->batcher_cond_enter));
-        free(region->batcher); // Free the batcher
-        free(region->dual_segments->controls); // Free the control fields
-        free(region->dual_segments->ro_words); // Free the read-only segment
-        free(region->dual_segments->rw_words); // Free the read-write segment
-        free(region->dual_segments); // Free the dual segment
-        free(region); // Free the region
+        free(region->batcher);
+        // Clean up resources
+        for (size_t i = 0; i < num_words; i++) {
+            pthread_mutex_destroy(&(segment->controls[i].word_mutex));
+        }
+        free(segment->controls);
+        free(segment->rw_words);
+        free(segment->ro_words);
+        free(segment);
+        pthread_mutex_destroy(&(region->segments_mutex));
+        free(region);
         return invalid_shared;
     }
 
-    return (shared_t)region; // Ensure correct return type
+    if (pthread_cond_init(&(region->batcher->batcher_cond_wake_up), NULL) != 0) {
+        printf("Condition variable initialization failed for batcher_cond_wake_up\n");
+        pthread_cond_destroy(&(region->batcher->batcher_cond_enter));
+        pthread_mutex_destroy(&(region->batcher->batcher_mutex));
+        free(region->batcher);
+        // Clean up resources
+        for (size_t i = 0; i < num_words; i++) {
+            pthread_mutex_destroy(&(segment->controls[i].word_mutex));
+        }
+        free(segment->controls);
+        free(segment->rw_words);
+        free(segment->ro_words);
+        free(segment);
+        pthread_mutex_destroy(&(region->segments_mutex));
+        free(region);
+        return invalid_shared;
+    }
+
+    return (shared_t)region; // Return the initialized shared memory region
 }
 
 
@@ -208,35 +260,44 @@ void tm_destroy(shared_t shared) {
     struct region* region = (struct region*)shared;
 
     // Free all segments
-    for (size_t i = 0; i < region->segment_count; i++) {
-        dual_segment* seg = &(region->dual_segments[i]);
-        
-        // Free individual segment properties if they were dynamically allocated
-        free(seg->ro_words);
-        free(seg->rw_words);
-        free(seg->controls);
-    }
-
-    // Free the dual segment array
-    free(region->dual_segments);
-
-    // Free the batcher data
-    pthread_mutex_destroy(&region->batcher->batcher_mutex);
-    pthread_cond_destroy(&region->batcher->batcher_cond_wake_up);
-    pthread_cond_destroy(&region->batcher->batcher_cond_enter);
-    
-    // Free the blocked threads list if dynamically allocated
-    blocked_thread_node_t* current = region->batcher->blocked_head;
+    dual_segment* current = region->segment_head;
     while (current) {
-        blocked_thread_node_t* next = current->next;
+        dual_segment* next = current->next;
+
+        // Free the controls array
+        for (size_t i = 0; i < current->size; i++) {
+            pthread_mutex_destroy(&(current->controls[i].word_mutex));
+        }
+        free(current->controls);
+
+        // Free the rw_words and ro_words
+        free(current->rw_words);
+        free(current->ro_words);
+
+        // Free the segment itself
         free(current);
+
         current = next;
     }
 
-    // Free the batcher structure itself
+    // Free the batcher data
+    pthread_mutex_destroy(&(region->batcher->batcher_mutex));
+    pthread_cond_destroy(&(region->batcher->batcher_cond_enter));
+    pthread_cond_destroy(&(region->batcher->batcher_cond_wake_up));
+
+    // Free the blocked threads list
+    blocked_thread_node_t* current_blocked = region->batcher->blocked_head;
+    while (current_blocked) {
+        blocked_thread_node_t* next_blocked = current_blocked->next;
+        free(current_blocked);
+        current_blocked = next_blocked;
+    }
+
+    // Free the batcher
     free(region->batcher);
 
     // Free the region
+    pthread_mutex_destroy(&(region->segments_mutex));
     free(region);
 }
 
@@ -247,8 +308,7 @@ void tm_destroy(shared_t shared) {
 void* tm_start(shared_t shared) {
     // The first segment is always allocated, and is at the end of the linked list
     struct region* region = (struct region*)shared;
-    return region->dual_segments->ro_words;
-
+    return region->segment_head->ro_words;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -257,7 +317,7 @@ void* tm_start(shared_t shared) {
 **/
 size_t tm_size(shared_t shared) {
     struct region* region = (struct region*)shared;
-    return region->dual_segments->size;
+    return region->segment_head->size * region->align;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
@@ -375,15 +435,20 @@ bool tm_end(shared_t shared, tx_t tx) {
 
 
         // Update the segments (swap read-only and read-write segments, update control fields, etc.)
-        dual_segment* segments = region->dual_segments;
-        for (size_t i = 0; i < region->segment_count; i++) {
-            // No need for locks as we no that no other thread is accessing the segments
-            dual_segment* current = &(segments[i]);
-            void* temp = current->ro_words;
+        dual_segment* current = region->segment_head;
+        while (current) {
+            // Swap the read-only and read-write segments
+            uint8_t* temp = current->ro_words;
             current->ro_words = current->rw_words;
             current->rw_words = temp;
-            current->controls->written_while_epoch = false;
-            current->controls->access_set = -1;
+
+            // Reset the control fields
+            for (size_t i = 0; i < current->size; i++) {
+                current->controls[i].written_while_epoch = false;
+                current->controls[i].access_set = ACC_SET_NONE;
+            }
+
+            current = current->next;
         }
 
         // Wake up all threads that are blocked
@@ -432,7 +497,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     }
 
     // Calculate word offsets
-    size_t word_size = region->align;
+    size_t word_size = region->align;                                    // Number of bytes per word
     size_t min_words_offset = bytes_offset / word_size;                  // Start word index
     size_t max_words_offset = (bytes_offset + size - 1) / word_size;     // End word index
     size_t num_words = max_words_offset - min_words_offset + 1;          // Total words to read
@@ -443,7 +508,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     // Lock the control fields for all words involved
     for (size_t i = min_words_offset, lock_index = 0; i <= max_words_offset; i++, lock_index++) {
         // Lock the control field mutex for each word
-        pthread_mutex_t* mutex = &(segment->controls[i].segment_mutex);
+        pthread_mutex_t* mutex = &(segment->controls[i].word_mutex);
         pthread_mutex_lock(mutex);
         acquired_locks[lock_index] = mutex;  // Store the mutex to unlock later
     }
@@ -490,19 +555,20 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
                     // Transaction is already in the access set: read from writable copy
                     memcpy(dst_ptr, segment->rw_words + current_word_offset * word_size, word_size);
                 } else {
-                    // Transaction must abort
-                    success = false;
-                    break;
+                    // Should never happen, as we checked this before => aborted
                 }
             } else {
                 // The word was not written in the current epoch
                 // Read from the readable copy
                 memcpy(dst_ptr, segment->ro_words + current_word_offset * word_size, word_size);
                 // Add transaction to the access set
-                if (ctrl->access_set == -1) {
+                if (ctrl->access_set == ACC_SET_NONE) {
                     ctrl->access_set = (intptr_t)transaction;
-                } else if (ctrl->access_set != (intptr_t)transaction && ctrl->access_set != -2) {
-                    ctrl->access_set = -2;
+                } else if (ctrl->access_set != (intptr_t)transaction && ctrl->access_set != ACC_SET_MULTIPLE) {
+                    ctrl->access_set = ACC_SET_MULTIPLE;
+                } else {
+                    // Case 1: If mutiple => no need to change as we would change to multiple
+                    // Case 2: If one but us => no need to change as we are already in the set
                 }
             }
 
@@ -532,7 +598,94 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
  * @return Whether the whole transaction can continue
 **/
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
-    return false;
+    struct region* region = (struct region*)shared;
+    struct transaction* transaction = (struct transaction*)tx;
+
+    // Validate input parameters
+    if (size == 0 || size % region->align != 0) {
+        // Size must be a positive multiple of the alignment
+        return false;
+    }
+
+    // Find the segment
+    dual_segment* segment = find_segment(region, target);
+    if (!segment) {
+        // Target address not in any segment
+        return false;
+    }
+
+    // Verify that we are not writing out of bounds
+    size_t bytes_offset = (uint8_t*)target - segment->ro_words;
+    if (bytes_offset + size > segment->size) {
+        // Out of bounds
+        return false;
+    }
+
+    // Calculate word offsets
+    size_t word_size = region->align;                                    // Number of bytes per word
+    size_t min_words_offset = bytes_offset / word_size;                  // Start word index
+    size_t max_words_offset = (bytes_offset + size - 1) / word_size;     // End word index
+    size_t num_words = max_words_offset - min_words_offset + 1;          // Total words to write
+
+    // Array to keep track of acquired locks for unlocking later
+    pthread_mutex_t* acquired_locks[num_words];
+
+    // Lock the control fields for all words involved
+    for (size_t i = min_words_offset, lock_index = 0; i <= max_words_offset; i++, lock_index++) {
+        pthread_mutex_t* mutex = &(segment->controls[i].word_mutex);
+        pthread_mutex_lock(mutex);
+        acquired_locks[lock_index] = mutex;  // Store the mutex to unlock later
+    }
+
+    // Check if the transaction can continue
+    bool success = true;
+    for (size_t i = min_words_offset; i <= max_words_offset; i++) {
+        controls* ctrl = &segment->controls[i];
+
+        if (ctrl->written_while_epoch) {
+            if (ctrl->access_set == (intptr_t)transaction) {
+                // Transaction is already in the access set: proceed
+                continue;
+            } else {
+                // Transaction must abort due to write-write conflict
+                success = false;
+                break;
+            }
+        } else {
+            if (ctrl->access_set != ACC_SET_NONE && ctrl->access_set != (intptr_t)transaction) {
+                // At least one other transaction is in the access set: abort
+                success = false;
+                break;
+            }
+        }
+    }
+
+    if (success) {
+        // Perform the write operation in a single memcpy
+        memcpy(segment->rw_words + bytes_offset, source, size);
+
+        // Update control structures for all words involved
+        for (size_t i = min_words_offset; i <= max_words_offset; i++) {
+            controls* ctrl = &segment->controls[i];
+
+            // Add the transaction into the access set (if not already in)
+            if (ctrl->access_set == ACC_SET_NONE) {
+                ctrl->access_set = (intptr_t)transaction;
+            } else if (ctrl->access_set != (intptr_t)transaction) {
+                // Should not reach here since we checked above
+            }
+
+            // Mark that the word has been written in the current epoch
+            ctrl->written_while_epoch = true;
+        }
+    }
+
+    // Unlock the control fields in reverse order to prevent potential deadlocks
+    for (size_t i = num_words; i > 0; i--) {
+        pthread_mutex_unlock(acquired_locks[i - 1]);
+    }
+
+    return success;  // Return whether the transaction can continue
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
@@ -542,8 +695,104 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
-    return abort_alloc;
+alloc_t tm_alloc(shared_t shared, unused(tx_t tx), size_t size, void** target) {
+    struct region* region = (struct region*)shared;
+
+    // Validate input parameters
+    if (size == 0 || size % region->align != 0) {
+        // The length 'size' must be a positive multiple of the alignment
+        // Behavior is undefined; returning abort_alloc as per guidelines
+        return abort_alloc;
+    }
+
+    // Check that size is at most 2^48
+    if (size > ((size_t)1 << 48)) {
+        // Size exceeds maximum allowed value
+        return nomem_alloc;
+    }
+
+    // Allocate the dual_segment structure
+    dual_segment* segment = (dual_segment*)malloc(sizeof(dual_segment));
+    if (!segment) {
+        return nomem_alloc;
+    }
+
+    // Calculate the number of words
+    size_t word_size = region->align;
+    size_t num_words = size / word_size;
+    segment->size = num_words;  // Number of words in the segment
+
+    // Set can_be_freed to true (new segments can be freed)
+    segment->can_be_freed = true;
+
+    // Initialize next pointer
+    segment->next = NULL;
+
+    // Allocate memory for ro_words
+    segment->ro_words = (uint8_t*)malloc(size);
+    if (!segment->ro_words) {
+        free(segment);
+        return nomem_alloc;
+    }
+
+    // Allocate memory for rw_words
+    segment->rw_words = (uint8_t*)malloc(size);
+    if (!segment->rw_words) {
+        free(segment->ro_words);
+        free(segment);
+        return nomem_alloc;
+    }
+
+    // Allocate memory for controls array
+    segment->controls = (controls*)malloc(num_words * sizeof(controls));
+    if (!segment->controls) {
+        free(segment->rw_words);
+        free(segment->ro_words);
+        free(segment);
+        return nomem_alloc;
+    }
+
+    // Initialize the copies to zeroes
+    memset(segment->ro_words, 0, size);
+    memset(segment->rw_words, 0, size);
+
+    // Initialize the control structures
+    for (size_t i = 0; i < num_words; i++) {
+        // Initialize the mutex
+        pthread_mutex_init(&segment->controls[i].word_mutex, NULL);
+
+        // Initialize other fields
+        segment->controls[i].written_while_epoch = false;
+        segment->controls[i].access_set = ACC_SET_NONE;
+    }
+
+    // Register the segment in the set of allocated segments
+    pthread_mutex_lock(&region->segments_mutex);
+
+    // Add the segment to the head of the linked list
+    segment->next = region->segment_head;
+    region->segment_head = segment;
+
+    pthread_mutex_unlock(&region->segments_mutex);
+
+    // Set *target to the starting address of the segment's read-only words
+    *target = (void*)segment->ro_words;
+
+    // Ensure that *target is not NULL
+    if (*target == NULL) {
+        // This should not happen, but handle it just in case
+        // Clean up resources
+        for (size_t i = 0; i < num_words; i++) {
+            pthread_mutex_destroy(&segment->controls[i].word_mutex);
+        }
+        free(segment->controls);
+        free(segment->rw_words);
+        free(segment->ro_words);
+        free(segment);
+        return nomem_alloc;
+    }
+
+    return success_alloc;  // Allocation was successful
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
@@ -553,19 +802,66 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t shared, tx_t tx, void* target) {
-    return false;
+    struct region* region = (struct region*)shared;
+
+    // Find the segment to free
+    dual_segment* current = region->segment_head;
+    dual_segment* previous = NULL;
+    while (current) {
+        if (current->ro_words == target) {
+            // Found the segment to free
+            break;
+        }
+        previous = current;
+        current = current->next;
+    }
+
+    if (!current) {
+        // Segment not found
+        return false;
+    }
+
+    // Check if the segment can be freed
+    if (!current->can_be_freed) {
+        // The segment cannot be freed
+        return false;
+    }
+
+    // Lock the segment list
+    pthread_mutex_lock(&region->segments_mutex);
+
+    // Remove the segment from the list
+    if (previous) {
+        previous->next = current->next;
+    } else {
+        region->segment_head = current->next;
+    }
+
+    pthread_mutex_unlock(&region->segments_mutex);
+
+    // Free the segment
+    for (size_t i = 0; i < current->size; i++) {
+        pthread_mutex_destroy(&current->controls[i].word_mutex);
+    }
+    free(current->controls);
+    free(current->rw_words);
+    free(current->ro_words);
+    free(current);
+
+    return true;
 }
 
 // -------------------------------------------- HELPER FUNCTIONS --------------------------------------------
 
 dual_segment* find_segment(struct region* region, const void* addr) {
-    for (size_t i = 0; i < region->segment_count; i++) {
-        dual_segment* segment = &region->dual_segments[i];
-        uint8_t* start = segment->ro_words;
-        uint8_t* end = start + segment->size;
-        if (addr >= (void*)start && addr < (void*)end) {
-            return segment;
+    dual_segment* current = region->segment_head;
+    while (current) {
+        void* start = current->ro_words;
+        void* end = start + current->size * region->align;
+        if (addr >= start && addr < end) {
+            return current;
         }
+        current = current->next;
     }
     return NULL;
 }
