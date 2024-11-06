@@ -286,6 +286,11 @@ shared_t tm_create(size_t size, size_t align) {
  * @param shared Shared memory region to destroy, with no running transaction
 **/
 void tm_destroy(shared_t shared) {
+    // Verification on the shared memory region
+    if (!shared) {
+        return;
+    }
+
     struct region* region = (struct region*)shared;
 
     // Free all segments
@@ -375,18 +380,23 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     // Assign transaction properties
     tx->is_ro = is_ro;
 
+    // Variables to determine whether to broadcast
+    bool should_broadcast_enter = false;
+    bool should_broadcast_wake_up = false;
+
     // Enter the batcher
     batcher_data* batcher = region->batcher;
     pthread_mutex_lock(&(batcher->batcher_mutex));
     while (batcher->wake_up_threads_only) {
-        pthread_cond_broadcast(&(batcher->batcher_cond_enter));
+        pthread_cond_wait(&(batcher->batcher_cond_enter), &(batcher->batcher_mutex));
+        //printf("%ld: Woken up from enter at %ld\n", pthread_self() % 1000, time(NULL));
     }
     if (batcher->remaining == 0) {
         // First thread entering, no one is blocked
-        //printf("%ld: First thread entering\n", pthread_self());
+        //printf("%ld: First thread entering\n", pthread_self() % 1000);
         batcher->remaining = 1;
     } else {
-        //printf("%ld: Blocked at %ld\n", pthread_self(), time(NULL));
+        //printf("%ld: Blocked at %ld\n", pthread_self() % 1000, time(NULL));
         // Block this thread
         blocked_thread_node_t* new_node = (blocked_thread_node_t*)malloc(sizeof(blocked_thread_node_t));
         if (!new_node) {
@@ -405,15 +415,17 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
         // Wait until "woken up"
         while (!batcher->wake_up_threads_only) {
             pthread_cond_wait(&(batcher->batcher_cond_wake_up), &(batcher->batcher_mutex));
+            //printf("%ld: Woken up from blocked at %ld\n", pthread_self() % 1000, time(NULL));
         }
-        //printf("%ld: Unblocked at %ld\n", pthread_self(), time(NULL));
+        //printf("%ld: Unblocked at %ld\n", pthread_self() % 1000, time(NULL));
 
         // Remove the thread from the blocked list
         blocked_thread_node_t* current = batcher->blocked_head;
         blocked_thread_node_t* previous = NULL;
+
         while (current) {
             if (current->thread == pthread_self()) {
-                //printf("%ld: Removing thread from the blocked list\n", pthread_self());
+                //printf("%ld: Removing thread from the blocked list (%ld remaining)\n", pthread_self() % 1000, batcher->blocked_count-1);
                 if (previous) {
                     previous->next = current->next;
                 } else {
@@ -423,9 +435,11 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
                 batcher->blocked_count--;
                 batcher->remaining++;
                 if (batcher->blocked_count == 0) {
-                    //printf("%ld: No more blocked threads\n", pthread_self());
+                    //printf("%ld: No more blocked threads\n", pthread_self() % 1000);
                     batcher->wake_up_threads_only = false;
-                    pthread_cond_broadcast(&(batcher->batcher_cond_enter));
+                    should_broadcast_enter = true;
+                } else {
+                    should_broadcast_wake_up = true;
                 }
                 break;
             }
@@ -435,7 +449,16 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     }
 
     pthread_mutex_unlock(&(batcher->batcher_mutex));
-    //printf("%ld: Release the mutex at %ld\n", pthread_self(), time(NULL));
+    //printf("%ld: Begin: release the mutex at %ld\n", pthread_self() % 1000, time(NULL));
+
+    if (should_broadcast_enter) {
+        pthread_cond_broadcast(&(batcher->batcher_cond_enter));
+        //printf("%ld: Broadcasted enter\n", pthread_self() % 1000);
+    } else if (should_broadcast_wake_up) {
+        pthread_cond_broadcast(&(batcher->batcher_cond_wake_up));
+        //printf("%ld: Broadcasted wake up\n", pthread_self() % 1000);
+    }
+
 
     return (tx_t)tx; // Ensure correct return type
 }
@@ -454,14 +477,13 @@ bool tm_end(shared_t shared, tx_t tx) {
     pthread_mutex_lock(&(batcher->batcher_mutex));
     batcher->remaining -= 1;
     if (batcher->remaining == 0) {
-        //printf("%ld: Last thread leaving!\n", pthread_self());
+        //printf("%ld: Last thread leaving!\n", pthread_self() % 1000);
 
         // End the epoch
         batcher->epoch += 1;
         batcher->wake_up_threads_only = true;
 
-        //printf("%ld: New epoch: %ld\n", pthread_self(), batcher->epoch);
-
+        //printf("%ld: New epoch: %ld\n", pthread_self() % 1000, batcher->epoch);
 
         // Update the segments (swap read-only and read-write segments, update control fields, etc.)
         dual_segment* current = region->segment_head;
@@ -482,10 +504,10 @@ bool tm_end(shared_t shared, tx_t tx) {
 
         // Wake up all threads that are blocked
         pthread_cond_broadcast(&(batcher->batcher_cond_wake_up));
-        //printf("%ld: Broadcasted wake up\n", pthread_self());
+        //printf("%ld: Broadcasted wake up\n", pthread_self() % 1000);
     }
     pthread_mutex_unlock(&(batcher->batcher_mutex));
-    //printf("%ld: Release the mutex at %ld\n", pthread_self(), time(NULL));
+    //printf("%ld: End: Release the mutex at %ld\n", pthread_self() % 1000, time(NULL));
 
     // Free the transaction
     free(transaction);
@@ -508,6 +530,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     // Validate input parameters
     if (size == 0 || size % region->align != 0) {
         // Size must be a positive multiple of the alignment
+        printf("Invalid size\n");
         return false;
     }
 
@@ -515,13 +538,15 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     dual_segment* segment = find_segment(region, source);
     if (!segment) {
         // Source address not in any segment
+        printf("Source address not in any segment\n");
         return false;
     }
 
     // Verify that we are not reading out of bounds
     size_t bytes_offset = (uint8_t*)source - segment->ro_words;
-    if (bytes_offset + size > segment->size) {
+    if (bytes_offset + size > segment->size * region->align) {
         // Out of bounds
+        printf("Out of bounds\n");
         return false;
     }
 
@@ -633,6 +658,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     // Validate input parameters
     if (size == 0 || size % region->align != 0) {
         // Size must be a positive multiple of the alignment
+        printf("Invalid size or alignment\n");
         return false;
     }
 
@@ -640,13 +666,15 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     dual_segment* segment = find_segment(region, target);
     if (!segment) {
         // Target address not in any segment
+        printf("Target address not in any segment\n");
         return false;
     }
 
     // Verify that we are not writing out of bounds
     size_t bytes_offset = (uint8_t*)target - segment->ro_words;
-    if (bytes_offset + size > segment->size) {
+    if (bytes_offset + size > segment->size * region->align) {
         // Out of bounds
+        printf("Out of bounds\n");
         return false;
     }
 
