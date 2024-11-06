@@ -71,15 +71,44 @@ struct transaction {
     bool is_ro;                             // Whether the transaction is read-only
 };
 
+// -------------------------------------------- HELPER FUNCTIONS --------------------------------------------
+
+dual_segment* find_segment(struct region* region, const void* addr) {
+    dual_segment* current = region->segment_head;
+    while (current) {
+        void* start = current->ro_words;
+        void* end = start + current->size * region->align;
+        if (addr >= start && addr < end) {
+            return current;
+        }
+        current = current->next;
+    }
+    return NULL;
+}
+
+// ------------------------------------- TRANSACTION MANAGER FUNCTIONS --------------------------------------
+
 /** Create a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
  * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
 **/
 shared_t tm_create(size_t size, size_t align) {
-    // Verify the size and alignment parameters
-    if (size == 0 || align == 0 || size % align != 0 || (align & (align - 1)) != 0) {
-        printf("Invalid size or alignment\n");
+    // Verifications on the size
+    if ((size <= 0) || (size > pow(2, 48))) {
+        //printf("Invalid size\n");
+        return invalid_shared;
+    }
+
+    // Verifications on the alignment
+    if ((align & (align - 1)) != 0) {
+        //printf("Invalid alignment\n");
+        return invalid_shared;
+    }
+
+    // Verifications on the size and alignment
+    if ((size % align != 0)) {
+        //printf("Size is not a multiple of the alignment\n");
         return invalid_shared;
     }
 
@@ -851,17 +880,3 @@ bool tm_free(shared_t shared, tx_t tx, void* target) {
     return true;
 }
 
-// -------------------------------------------- HELPER FUNCTIONS --------------------------------------------
-
-dual_segment* find_segment(struct region* region, const void* addr) {
-    dual_segment* current = region->segment_head;
-    while (current) {
-        void* start = current->ro_words;
-        void* end = start + current->size * region->align;
-        if (addr >= start && addr < end) {
-            return current;
-        }
-        current = current->next;
-    }
-    return NULL;
-}

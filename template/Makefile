@@ -7,7 +7,8 @@ EXT_CXX  := C cc cpp cxx c++
 
 INCLUDE_DIR := ../include
 SOURCE_DIR  := .
-TEST_SRC := ./tests/tm_test.c  # Adjust this to where tm_test.c is located
+TEST_SRC := ./tests/tm_test.c 
+UNIT_TEST_SRC := ./tests/unit_tests.c  
 
 WILD_EXT  = $(strip $(foreach EXT,$($(1)),$(wildcard $(2)/*.$(EXT))))
 
@@ -20,6 +21,8 @@ OBJS     := $(SRCS_C:%=%.o) $(SRCS_CXX:%=%.o)
 # Test-related settings
 TEST_OBJ := $(TEST_SRC:.c=.o)
 TEST_EXEC := tm_test
+UNIT_TEST_OBJ := $(UNIT_TEST_SRC:.c=.o)
+UNIT_TEST_EXEC := unit_tests
 
 CC       := $(CC)
 CCFLAGS  := -Wall -Wextra -Wfatal-errors -O2 -std=c11 -fPIC -I$(INCLUDE_DIR)
@@ -31,10 +34,10 @@ LDLIBS   := -lm -lpthread
 
 .PHONY: build clean run_test
 
-build: $(BIN) $(TEST_EXEC)
+build: $(BIN) $(TEST_EXEC) $(UNIT_TEST_EXEC) 
 
 clean:
-	$(RM) $(OBJS) $(BIN) $(TEST_OBJ) $(TEST_EXEC)
+	$(RM) $(OBJS) $(BIN) $(TEST_OBJ) $(TEST_EXEC) $(UNIT_TEST_OBJ) $(UNIT_TEST_EXEC)
 
 define BUILD_C
 %.$(1).o: %.$(1) $$(HDRS_C) Makefile
@@ -60,3 +63,13 @@ $(TEST_EXEC): $(TEST_OBJ) $(OBJS)
 
 run_test: $(TEST_EXEC)
 	./$(TEST_EXEC)
+
+# Compile and link unit_tests.c
+$(UNIT_TEST_OBJ): $(UNIT_TEST_SRC) $(HDRS_C)
+	$(CC) $(CCFLAGS) -c -o $@ $<
+
+$(UNIT_TEST_EXEC): $(UNIT_TEST_OBJ) $(OBJS)
+	$(CC) $(CCFLAGS) -o $@ $(UNIT_TEST_OBJ) $(OBJS) $(LDLIBS)
+
+run_unit_test: $(UNIT_TEST_EXEC)
+	./$(UNIT_TEST_EXEC)
