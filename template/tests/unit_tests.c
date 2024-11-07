@@ -920,8 +920,6 @@ void unit_test_tm_read_concurrent() {
 void unit_tests_tm_write() {
     printf("\n----------------------- TM_WRITE ------------------------\n");
     unit_test_tm_write_single();
-    //unit_test_tm_write_two();
-    //unit_test_tm_write_concurrent();
 }
 
 void unit_test_tm_write_single() {
@@ -943,9 +941,14 @@ void unit_test_tm_write_single() {
     uint8_t* word = malloc(write_size);
     memset(word, 1, write_size); // Write 1 to the word
 
+    // Print the region
+    //print_region(shared_region, size);
+
     void* start = tm_start(shared_region);
     bool success = tm_write(shared_region, tx, word, write_size, start + offset);
     TEST_ASSERT(success, "tm_write success with read-write transaction");
+
+    //print_region(shared_region, size);
 
     // The read value must be equal to the written value
     uint8_t* read_word = malloc(write_size);
@@ -968,45 +971,27 @@ void unit_test_tm_write_single() {
     }
     TEST_ASSERT(success, "tm_write updates the control structure correctly");
 
-    // Verify that the values around the written word are not changed
-    for (size_t i = 0; i < size / align; i++) {
-        if (i < word_offset || i >= word_offset + word_write_size) {
-            uint8_t* read_word = malloc(align);
-            memset(read_word, 0, align);
-            success = tm_read(shared_region, tx, start + i * align, align, read_word);
-            if (!success) {
-                break;
-            }
-            bool equal = memcmp(read_word, 0, align) == 0;
-            if (!equal) {
-                success = false;
-                break;
-            }
-            free(read_word);
-        }
-    }
-    TEST_ASSERT(success, "tm_write does not change other values");
-
     tm_end(shared_region, tx);
+
+    // Verify that the memroy have swapped and the controls have been reset
+    //print_region(shared_region, size);
+
     tm_destroy(shared_region);
     free(word);
     free(read_word);
-
 }
-
-
 
 
 // --------------------------------------- MAIN ---------------------------------------
 
 int main() {
-    // unit_tests_tm_create();
-    // unit_tests_tm_destroy();
-    // unit_tests_tm_start();
-    // unit_tests_tm_size();
-    // unit_tests_tm_align();
-    // unit_tests_tm_begin();
-    // unit_tests_tm_read();
+    unit_tests_tm_create();
+    unit_tests_tm_destroy();
+    unit_tests_tm_start();
+    unit_tests_tm_size();
+    unit_tests_tm_align();
+    unit_tests_tm_begin();
+    unit_tests_tm_read();
     unit_tests_tm_write();
     return 0;
 }

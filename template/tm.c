@@ -86,6 +86,73 @@ dual_segment* find_segment(struct region* region, const void* addr) {
     return NULL;
 }
 
+// Function to print a given number of bytes from an array (for display purposes)
+void print_bytes(uint8_t* data, size_t size, size_t max_display) {
+    printf("[ ");
+    for (size_t i = 0; i < (size < max_display ? size : max_display); i++) {
+        printf("%02X ", data[i]);
+    }
+    if (size > max_display) {
+        printf("... ");
+    }
+    printf("]");
+}
+
+// Function to print a single controls structure as a row in a table
+void print_controls_row(const controls* ctrl, size_t index) {
+    printf("        | %-6zu | %-18s | %-18ld | %-23p |\n", index, ctrl->written_while_epoch ? "true" : "false", ctrl->access_set, (void*)&ctrl->word_mutex);
+}
+
+// Function to print a dual_segment structure as a table
+void print_dual_segment(const dual_segment* segment, size_t max_bytes, const region* region) {
+    printf("\n        Read-Only Words (%p): ", (void*)segment->ro_words);
+    if (segment->ro_words) {
+        print_bytes(segment->ro_words, segment->size * region->align * sizeof(uint8_t), max_bytes);
+    } else {
+        printf("NULL");
+    }
+    printf("\n        Read-Write Words (%p): ", (void*)segment->rw_words);
+    if (segment->rw_words) {
+        print_bytes(segment->rw_words, segment->size * region->align * sizeof(uint8_t), max_bytes);
+    } else {
+        printf("NULL");
+    }
+    printf("\n        Size (number of words): %zu\n", segment->size);
+    printf("        Can Be Freed: %s\n", segment->can_be_freed ? "true" : "false");
+    printf("        Next Segment: %p\n\n", (void*)segment->next);
+
+    printf("        Controls Table:\n");
+    printf("        +--------+--------------------+--------------------+-------------------------+\n");
+    printf("        | Index  | Written While Epoch|    Access Set      | Word Mutex Address      |\n");
+    printf("        +--------+--------------------+--------------------+-------------------------+\n");
+    for (size_t i = 0; i < segment->size; i++) {
+        print_controls_row(&segment->controls[i], i);
+    }
+    printf("        +--------+--------------------+--------------------+-------------------------+\n");
+}
+
+// Function to print a region structure as a table
+void print_region(const region* reg, size_t max_bytes) {
+    printf("\nRegion:\n");
+    printf("\n  Alignment (bytes per word): %zu\n", reg->align);
+    printf("  Segments Mutex Address: %p\n", (void*)&reg->segments_mutex);
+    if (reg->batcher) {
+        printf("  Batcher Address: %p\n", (void*)reg->batcher);
+    } else {
+        printf("  Batcher: NULL\n");
+    }
+
+    printf("\n  Segments List:\n");
+    const dual_segment* current_segment = reg->segment_head;
+    size_t segment_index = 0;
+    while (current_segment) {
+        printf("\n      Segment #%zu:\n", segment_index);
+        print_dual_segment(current_segment, max_bytes, reg);
+        current_segment = current_segment->next;
+        segment_index++;
+    }
+}
+
 // ------------------------------------- TRANSACTION MANAGER FUNCTIONS --------------------------------------
 
 /** Create a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
