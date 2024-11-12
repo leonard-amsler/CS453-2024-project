@@ -25,7 +25,7 @@ LDFLAGS  :=
 LDLIBS   := -ldl -lpthread
 
 LIB_DIRS := $(filter-out ../include/ ../grading/ ../playground/ ../template/ ../sync-examples/,$(filter-out $(wildcard ../*),$(wildcard ../*/)))
-LIB_SOS  := $(patsubst %/,%.so,$(filter-out ../reference/,$(LIB_DIRS)))
+LIB_SOS  := $(patsubst %/,%.so,$(filter-out ../template/,$(LIB_DIRS)))
 
 .PHONY: build build-libs clean clean-libs run
 
@@ -37,7 +37,7 @@ clean:
 clean-libs:
 	@$(foreach DIR,$(LIB_DIRS),make -C $(DIR) clean; )
 run: $(BIN)
-	$(BIN) 453 ../template.so $(LIB_SOS)
+	$(BIN) 453 ../reference.so $(LIB_SOS)
 
 define BUILD_C
 %.$(1).o: %.$(1) $$(HDRS_C) Makefile

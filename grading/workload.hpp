@@ -177,6 +177,9 @@ private:
                 start = segment.next; // Accounts are stored in linked segments, we move to the next one.
             }
             nbaccounts = count;
+            //printf("sum: %ld\n", sum);
+            //printf("count: %ld\n", count);
+
             return sum == static_cast<Balance>(init_balance * count); // Consistency check: no money should ever be destroyed or created out of thin air.
         });
     }
@@ -281,8 +284,9 @@ public:
         transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {
             AccountSegment segment{tx, tm.get_start()};
             segment.count = nbaccounts;
-            for (size_t i = 0; i < nbaccounts; ++i)
-                segment.accounts[i] = init_balance;
+            for (size_t i = 0; i < nbaccounts; ++i){
+                //printf("init_balance: %ld for account %ld\n", init_balance, i);
+                segment.accounts[i] = init_balance;}
         });
         auto correct = transactional(tm, Transaction::Mode::read_only, [&](Transaction& tx) {
             AccountSegment segment{tx, tm.get_start()};
@@ -330,12 +334,14 @@ public:
 
         barrier.sync();
         if (uid == 0) { // Only the first thread initializes the shared memory.
+            //printf("First thread is initializing\n");
             // We first write the initial value,
             auto init_counter = nbtxperwrk * nbworkers;
             transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {
                 Shared<size_t> counter{tx, tm.get_start()};
                 counter = init_counter;
             });
+            //printf("init_counter: %ld\n", init_counter);
 
             // And check in another transaction that it was written correctly.
             auto correct = transactional(tm, Transaction::Mode::read_only, [&](Transaction& tx) {
@@ -358,6 +364,7 @@ public:
                 Shared<size_t> counter{tx, tm.get_start()};
                 return counter.read();
             });
+            //printf("last: %ld\n", last);
 
             // And then we decrease the value of the counter after checking that it didn't increase since the last read.
             auto correct = transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {

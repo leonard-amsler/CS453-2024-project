@@ -60,6 +60,28 @@ struct region {
     size_t align;       // Size of a word in the shared memory region (in bytes)
 };
 
+// --------------------------------------- HELPERS ---------------------------------------
+
+void print_region(shared_t shared, size_t size) {
+    struct region* region = (struct region*)shared;
+    printf("\nRegion: %p\n", region);
+    printf("Start: %p\n", region->start);
+    printf("Size: %zu\n", region->size);
+    printf("Align: %zu\n", region->align);
+    printf("Allocs: %p\n", region->allocs);
+    printf("Start content: ");
+    for (size_t i = 0; i < size; i++) {
+        printf("%d ", ((uint8_t*)region->start)[i]);
+    }
+    segment_list current = region->allocs;
+    while (current) {
+        printf("Segment: %p\n", current);
+        current = current->next;
+    }
+
+}
+
+
 shared_t tm_create(size_t size, size_t align) {
     struct region* region = (struct region*) malloc(sizeof(struct region));
     if (unlikely(!region)) {
@@ -148,6 +170,7 @@ bool tm_end(shared_t shared, tx_t tx) {
     } else {
         shared_lock_release(&(((struct region*) shared)->lock));
     }
+    //print_region(shared, ((struct region*) shared)->size);
     return true;
 }
 

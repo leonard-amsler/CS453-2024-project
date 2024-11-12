@@ -34,7 +34,8 @@ LDLIBS   := -lm -lpthread
 
 .PHONY: build clean run_test
 
-build: $(BIN) $(TEST_EXEC) $(UNIT_TEST_EXEC) 
+#build: $(BIN) $(TEST_EXEC) $(UNIT_TEST_EXEC) 
+build: $(BIN) $(TEST_EXEC) 
 
 clean:
 	$(RM) $(OBJS) $(BIN) $(TEST_OBJ) $(TEST_EXEC) $(UNIT_TEST_OBJ) $(UNIT_TEST_EXEC)

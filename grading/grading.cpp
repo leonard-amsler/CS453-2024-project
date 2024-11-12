@@ -84,6 +84,7 @@ public:
     **/
     ::std::variant<Chrono, char const*> master_wait(Chrono::Tick maxtick = Chrono::invalid_tick) {
         // Wait for all worker threads, synchronize-with the last one
+        //printf("Maxtick: %lu\n", maxtick);
         if (!donelatch.wait(maxtick))
             throw Exception::BoundedOverrun{"Transactional library takes too long to process the transactions"};
         // Return runtime on success, of error message on failure
@@ -162,20 +163,24 @@ static auto measure(Workload& workload, unsigned int const nbthreads, unsigned i
                 // Threads are synchronized between each test so that they run with a lot of concurrency.
                 try {
                     // 1. Initialization
+                    //printf("Thread %d is initializing\n", i);
                     if (!sync.worker_wait()) return; // Sync. of threads
                     sync.worker_notify(workload.init()); // Runs the test and tells the master about errors
 
                     // 2. Performance measurements
+                    //printf("Thread %d is running\n", i);
                     for (unsigned int count = 0; count < nbrepeats; ++count) {
                         if (!sync.worker_wait()) return;
                         sync.worker_notify(workload.run(i, seed + nbthreads * count + i));
                     }
 
                     // 3. Correctness check
+                    //printf("Thread %d is checking\n", i);
                     if (!sync.worker_wait()) return;
                     sync.worker_notify(workload.check(i, std::random_device{}())); // Random seed is wanted here
 
                     // Synchronized quit
+                    //printf("Thread %d is done\n", i);
                     if (!sync.worker_wait()) return;
                     throw Exception::Unreachable{"unexpected worker iteration after checks"};
                 } catch (::std::exception const& err) {
@@ -263,10 +268,9 @@ int main(int argc, char** argv) {
         }
         // Get/set/compute run parameters
         auto const nbworkers = []() {
-            // auto res = ::std::thread::hardware_concurrency();
-            // if (unlikely(res == 0))
-            //     res = 16;
-            auto res = 1;
+            auto res = ::std::thread::hardware_concurrency();
+            if (unlikely(res == 0))
+                res = 16;
             return static_cast<size_t>(res);
         }();
         auto const nbtxperwrk    = 200000ul / nbworkers;
@@ -306,10 +310,13 @@ int main(int argc, char** argv) {
             ::std::cout << "⎧ Evaluating '" << argv[i] << "'" << (maxtick_init == Chrono::invalid_tick ? " (reference)" : "") << "..." << ::std::endl;
             // Load TM library
             TransactionalLibrary tl{argv[i]};
+
             // Initialize workload (shared memory lifetime bound to workload: created and destroyed at the same time)
+            //printf("Creating WorkloadBank\n");
             WorkloadBank bank{tl, nbworkers, nbtxperwrk, nbaccounts, expnbaccounts, init_balance, prob_long, prob_alloc};
             try {
                 // Actual performance measurements and correctness check
+                //printf("Measuring\n");
                 auto res = measure(bank, nbworkers, nbrepeats, seed, maxtick_init, maxtick_perf, maxtick_chck);
                 // Check false negative-free correctness
                 auto error = ::std::get<0>(res);
