@@ -271,6 +271,7 @@ private:
             Shared<Balance> sender{tx, send_ptr}; // Shared is a template that overloads copy to use tm_read/tm_write.
             Shared<Balance> recver{tx, recv_ptr};
             auto send_val = sender.read();
+            printf("send_val: %ld from account %ld to account %ld\n", send_val, send_id, recv_id);
             if (send_val > 0) {
                 sender = send_val - 1;
                 recver = recver.read() + 1;
