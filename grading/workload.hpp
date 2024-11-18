@@ -177,8 +177,10 @@ private:
                 start = segment.next; // Accounts are stored in linked segments, we move to the next one.
             }
             nbaccounts = count;
-            //printf("sum: %ld\n", sum);
-            //printf("count: %ld\n", count);
+
+            if (sum != static_cast<Balance>(init_balance * count)) // Consistency check: no money should ever be destroyed or created out of thin air.
+                printf("sum: %ld, init_balance: %ld, count: %ld\n", sum, init_balance, count);
+            
 
             return sum == static_cast<Balance>(init_balance * count); // Consistency check: no money should ever be destroyed or created out of thin air.
         });
@@ -309,19 +311,26 @@ public:
         size_t count = nbaccounts;
         for (size_t cntr = 0; cntr < nbtxperwrk; ++cntr) {
             if (long_dist(engine)) { // We roll a dice and, if "lucky", run a long transaction.
-                if (unlikely(!long_tx(count))) // If it fails, then we return an error message.
+                //printf("long_tx\n");
+                if (unlikely(!long_tx(count))) {// If it fails, then we return an error message.
+                    printf("long tx failed\n");
                     return "Violated isolation or atomicity";
+                }
             } else if (alloc_dist(engine)) { // Let's roll a dice again to trigger an allocation transaction.
+                //printf("alloc_tx\n");
                 alloc_tx(alloc_trigger(engine));
             } else { // No luck with previous rolls, let's just run a short transaction.
+                //printf("short_tx\n");
                 ::std::uniform_int_distribution<size_t> account{0, count - 1};
                 while (unlikely(!short_tx(account(engine), account(engine))));
             }
         }
         { // Last long transaction
             size_t dummy;
-            if (!long_tx(dummy))
+            if (!long_tx(dummy)){
+                printf("dummy long tx failed\n");
                 return "Violated isolation or atomicity";
+            }
         }
         return nullptr;
     }

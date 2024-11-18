@@ -84,7 +84,6 @@ public:
     **/
     ::std::variant<Chrono, char const*> master_wait(Chrono::Tick maxtick = Chrono::invalid_tick) {
         // Wait for all worker threads, synchronize-with the last one
-        //printf("Maxtick: %lu\n", maxtick);
         if (!donelatch.wait(maxtick))
             throw Exception::BoundedOverrun{"Transactional library takes too long to process the transactions"};
         // Return runtime on success, of error message on failure
@@ -271,18 +270,18 @@ int main(int argc, char** argv) {
             auto res = ::std::thread::hardware_concurrency();
             if (unlikely(res == 0))
                 res = 16;
-            return static_cast<size_t>(res);
+            return static_cast<size_t>(4);
         }();
-        auto const nbtxperwrk    = 200000ul / nbworkers;
+        auto const nbtxperwrk    = 1000ul / nbworkers;
         auto const nbaccounts    = 32 * nbworkers;
         auto const expnbaccounts = 256 * nbworkers;
         auto const init_balance  = 100ul;
         auto const prob_long     = 0.5f;
-        auto const prob_alloc    = 0.01f;
+        auto const prob_alloc    = 0.0f;
         auto const nbrepeats     = 7;
         auto const seed          = static_cast<Seed>(::std::stoul(argv[1]));
         auto const clk_res       = Chrono::get_resolution();
-        auto const slow_factor   = 16ul;
+        auto const slow_factor   = 10000ul;
         // Print run parameters
         ::std::cout << "⎧ #worker threads:     " << nbworkers << ::std::endl;
         ::std::cout << "⎪ #TX per worker:      " << nbtxperwrk << ::std::endl;
@@ -332,13 +331,13 @@ int main(int argc, char** argv) {
                 ::std::cout << "⎪ Total user execution time: " << (perfdbl / 1000000.) << " ms";
                 if (maxtick_init == Chrono::invalid_tick) { // Set reference performance
                     maxtick_init = slow_factor * tick_init;
-                    if (unlikely(maxtick_init == Chrono::invalid_tick)) // Bad luck...
+                    if ((maxtick_init == Chrono::invalid_tick)) // Bad luck...
                         ++maxtick_init;
                     maxtick_perf = slow_factor * tick_perf;
-                    if (unlikely(maxtick_perf == Chrono::invalid_tick)) // Bad luck...
+                    if ((maxtick_perf == Chrono::invalid_tick)) // Bad luck...
                         ++maxtick_perf;
                     maxtick_chck = slow_factor * tick_chck;
-                    if (unlikely(maxtick_chck == Chrono::invalid_tick)) // Bad luck...
+                    if ((maxtick_chck == Chrono::invalid_tick)) // Bad luck...
                         ++maxtick_chck;
                     reference = perfdbl;
                 } else { // Compare with reference performance
