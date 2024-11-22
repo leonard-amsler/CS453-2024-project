@@ -30,41 +30,25 @@
 #include <math.h>
 #include <sys/time.h>
 #include "macros.h"
-
-// Constants for the access set
-static const long ACC_SET_NONE = -1;
-static const long ACC_SET_MULTIPLE = -2;
-
-typedef struct running_thread_node {
-    pthread_t thread;                       // Thread identifier
-    struct running_thread_node* next;       // Next node in the list
-} running_thread_node_t;
-
-// Batcher data with synchronization primitives
-typedef struct blocked_thread_node {
-    pthread_t thread;                       // Thread identifier
-    struct blocked_thread_node* next;       // Next node in the list
-} blocked_thread_node_t;
+#include <stdatomic.h>
 
 // Batcher data with synchronization primitives
 typedef struct {
-    size_t epoch;                           // Current epoch
-    size_t remaining;                       // Remaining transactions in the current epoch
-    running_thread_node_t* running_head;    // Head of the running threads list
-    blocked_thread_node_t* blocked_head;    // Head of the blocked threads list
-    size_t blocked_count;                   // Number of blocked threads
-    pthread_mutex_t batcher_mutex;          // Mutex to protect batcher data
-    pthread_cond_t batcher_cond_wake_up;    // Condition variable to wake up threads that should be unblocked
-    pthread_cond_t batcher_cond_enter;      // Condition variable to wake up threads that should enter
-    int current_tx_id;                      // Current transaction identifier
-    bool wake_up_threads_only;              // Whether to wake up threads only
+    int epoch;                                  // Current epoch
+    int remaining;                              // Remaining transactions in the current epoch
+    int blocked_count;                          // Number of blocked threads
+    atomic_int current_tx_id;                   // Current transaction identifier
+    pthread_mutex_t batcher_mutex;              // Mutex to protect batcher data
+    pthread_cond_t batcher_cond_wake_up;        // Condition variable to wake up threads that should be unblocked
+    pthread_cond_t batcher_cond_enter;          // Condition variable to wake up threads that should enter
+    bool wake_up_threads_only;                  // Whether to wake up threads only
 } batcher_data;
 
 // Control structure for each word
 typedef struct {
-    bool written_while_epoch;               // Whether the word was written in the current epoch
-    void* owner;                            // Pointer to the transaction that owns this word
-    pthread_rwlock_t word_mutex;             // Mutex to protect the word
+    bool written_while_epoch;                   // Whether the word was written in the current epoch
+    void* owner;                                // Pointer to the transaction that owns this word
+    pthread_rwlock_t word_mutex;                // Mutex to protect the word
 } controls;
 
 // Dual segment structure
@@ -85,14 +69,14 @@ typedef struct region {
     pthread_mutex_t segments_mutex;         // Mutex to protect the segments list
 } region;
 
-// Transaction structure
+// Undo log entry structure
 struct undo_log_entry {
     void* addr;                             // Address in rw_words
-    uint8_t* original_value;                // Original data
-    size_t size;                            // Size of data
+    uint8_t* original_value;                // Original data (align bytes)
     struct undo_log_entry* next;            // Next entry in the undo log
 };
 
+// Transaction structure
 struct transaction {
     bool is_ro;                             // Whether the transaction is read-only
     size_t id;                              // Transaction identifier
@@ -116,28 +100,25 @@ dual_segment* find_segment(struct region* region, const void* addr) {
     return NULL;
 }
 
-void add_to_undo_log(struct transaction* tx, void* addr, uint8_t* original_value, size_t size) {
-    struct undo_log_entry* entry = malloc(sizeof(struct undo_log_entry));
-    if (unlikely(!entry)) {
-        return;
-    }
-    entry->addr = addr;
-    entry->original_value = original_value;
-    entry->size = size;
-    entry->next = tx->undo_log_head;
-    tx->undo_log_head = entry;
-}
+/**
+ * Function to rollback the transaction by restoring the original values of the written words
+ * @param region The shared memory region
+ * @param tx The transaction to rollback
+ */
+void rollback_tx(struct region* region, struct transaction* tx) {
 
-void rollback_transaction(struct region* region, struct transaction* tx) {
-    struct undo_log_entry* log_entry = tx->undo_log_head;
-    while (log_entry != NULL) {
-        memcpy(log_entry->addr, log_entry->original_value, log_entry->size);
-        struct undo_log_entry* temp = log_entry;
-        log_entry = log_entry->next;
-        free(temp->original_value);
-        free(temp);
+    // Iterate over the undo log and restore the original values
+    if (!tx->is_ro) {
+        struct undo_log_entry* log_entry = tx->undo_log_head;
+        while (log_entry != NULL) {
+            uint8_t* addr = log_entry->addr;
+            memcpy(addr, log_entry->original_value, region->align);
+            struct undo_log_entry* temp = log_entry;
+            log_entry = log_entry->next;
+        }
     }
-    tx->undo_log_head = NULL;
+
+    tm_end((shared_t)region, (tx_t)tx);
 }
 
 
@@ -350,10 +331,8 @@ shared_t tm_create(size_t size, size_t align) {
 
     region->batcher->epoch = 0;
     region->batcher->remaining = 0;
-    region->batcher->blocked_head = NULL;
     region->batcher->blocked_count = 0;
     region->batcher->wake_up_threads_only = false;
-    region->batcher->running_head = NULL;
 
     if (unlikely(pthread_mutex_init(&(region->batcher->batcher_mutex), NULL) != 0)) {
         free(region->batcher);
@@ -446,14 +425,6 @@ void tm_destroy(shared_t shared) {
     pthread_cond_destroy(&(region->batcher->batcher_cond_enter));
     pthread_cond_destroy(&(region->batcher->batcher_cond_wake_up));
 
-    // Free the blocked threads list
-    blocked_thread_node_t* current_blocked = region->batcher->blocked_head;
-    while (current_blocked) {
-        blocked_thread_node_t* next_blocked = current_blocked->next;
-        free(current_blocked);
-        current_blocked = next_blocked;
-    }
-
     // Free the batcher
     free(region->batcher);
 
@@ -518,6 +489,8 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
 
     pthread_mutex_lock(&(batcher->batcher_mutex));
 
+    //printf("\nTransaction %zu is starting\n", tx->id);
+
     while (batcher->wake_up_threads_only) {
 
         // If we should wake up thread but no thread is blocked, we can proceed
@@ -527,7 +500,9 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
             break;
         }
 
+        //printf("Transaction %zu is refused to enter\n", tx->id);
         pthread_cond_wait(&(batcher->batcher_cond_enter), &(batcher->batcher_mutex));
+        //printf("Transaction %zu woke up from being refused to enter\n", tx->id);
     }
 
 
@@ -535,70 +510,36 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
         // First thread entering, no one is blocked
         batcher->remaining = 1;
     } else {
-        // Print all running threads
-        running_thread_node_t* current_ = batcher->running_head;
-        while (current_) {
-            current_ = current_->next;
-        }
-        
-        blocked_thread_node_t* new_node = (blocked_thread_node_t*)malloc(sizeof(blocked_thread_node_t));
-        if (unlikely(!new_node)) {
-            free(tx);
-            pthread_mutex_unlock(&(batcher->batcher_mutex));
-            return invalid_tx;
-        }
-
-        new_node->thread = pthread_self();
-        new_node->next = batcher->blocked_head;
-        batcher->blocked_head = new_node;
 
         // Increment the count of blocked threads
         batcher->blocked_count++;
 
         // Wait until "woken up"
         while (!batcher->wake_up_threads_only) {
+            //printf("Transaction %zu is blocked\n", tx->id);
             pthread_cond_wait(&(batcher->batcher_cond_wake_up), &(batcher->batcher_mutex));
+            //printf("Transaction %zu woke up from being blocked\n", tx->id);
         }
 
-        // Remove the thread from the blocked list
-        blocked_thread_node_t* current = batcher->blocked_head;
-        blocked_thread_node_t* previous = NULL;
-
-        while (current) {
-            if (current->thread == pthread_self()) {
-                if (previous) {
-                    previous->next = current->next;
-                } else {
-                    batcher->blocked_head = current->next;
-                }
-                free(current);
-                batcher->blocked_count--;
-                batcher->remaining++;
-                if (batcher->blocked_count == 0) {
-                    batcher->wake_up_threads_only = false;
-                    should_broadcast_enter = true;
-                } else {
-                    should_broadcast_wake_up = true;
-                }
-                break;
-            }
-            previous = current;
-            current = current->next;
+        batcher->blocked_count--;
+        batcher->remaining++;
+        if (batcher->blocked_count == 0) {
+            //printf("No more threads to wake up, letting threads enter directly\n");
+            batcher->wake_up_threads_only = false;
+            should_broadcast_enter = true;
+        } else {
+            //printf("Waking up more threads from being blocked\n");
+            should_broadcast_wake_up = true;
         }
     }
-
-    // Adding the thread to the running list
-    running_thread_node_t* new_node = (running_thread_node_t*)malloc(sizeof(running_thread_node_t));
-    if (unlikely(!new_node)) {
-        free(tx);
-        pthread_mutex_unlock(&(batcher->batcher_mutex));
-        return invalid_tx;
-    }
-    new_node->thread = pthread_self();
-    new_node->next = batcher->running_head;
-    batcher->running_head = new_node;
 
     pthread_mutex_unlock(&(batcher->batcher_mutex));
+
+    if (should_broadcast_enter) {
+        pthread_cond_broadcast(&(batcher->batcher_cond_enter));
+    } else if (should_broadcast_wake_up) {
+        pthread_cond_broadcast(&(batcher->batcher_cond_wake_up));
+    }
 
     return (tx_t)tx; // Ensure correct return type
 }
@@ -614,6 +555,7 @@ bool tm_end(shared_t shared, tx_t tx) {
     batcher_data* batcher = region->batcher;
 
     pthread_mutex_lock(&(batcher->batcher_mutex));
+    //printf("\nTransaction %zu is ending\n", transaction->id);
 
     batcher->remaining -= 1;
     bool should_broadcast_enter = false;
@@ -621,18 +563,22 @@ bool tm_end(shared_t shared, tx_t tx) {
 
     if (batcher->remaining == 0) {
 
+        //printf("Finished epoch %d\n", batcher->epoch);
+
         // End the epoch
         batcher->epoch += 1;
 
         if (batcher->blocked_count > 0) {
+            //printf("Waking up %d threads\n", batcher->blocked_count);
             batcher->wake_up_threads_only = true;
             should_broadcast_wake_up = true;
         } else {
+            //printf("No threads to wake up, letting threads enter directly\n");
             batcher->wake_up_threads_only = false;
             should_broadcast_enter = true;
         }
 
-        // Update the segments (swap read-only and read-write segments, update control fields, etc.)
+        // Update the segments (copy rw_words to ro_words and reset control fields)
         dual_segment* current = region->segment_head;
         while (current) {
             // Copy content from rw_words to ro_words
@@ -649,23 +595,6 @@ bool tm_end(shared_t shared, tx_t tx) {
 
     }
 
-    // Remove the thread from the running list
-    running_thread_node_t* current = batcher->running_head;
-    running_thread_node_t* previous = NULL;
-    while (current) {
-        if (current->thread == pthread_self()) {
-            if (previous) {
-                previous->next = current->next;
-            } else {
-                batcher->running_head = current->next;
-            }
-            free(current);
-            break;
-        }
-        previous = current;
-        current = current->next;
-    }
-
     pthread_mutex_unlock(&(batcher->batcher_mutex));
 
     if (should_broadcast_enter) {
@@ -674,7 +603,7 @@ bool tm_end(shared_t shared, tx_t tx) {
         pthread_cond_broadcast(&(batcher->batcher_cond_wake_up));
     }
 
-    // Free the undo log
+    // Free the undo log as the transaction is ending
     struct undo_log_entry* log_entry = transaction->undo_log_head;
     while (log_entry != NULL) {
         struct undo_log_entry* temp = log_entry;
@@ -705,19 +634,22 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 
     // Validate input parameters
     if (unlikely(size == 0 || size % region->align != 0)) {
+        printf("Read size is invalid\n");
         return false;
     }
 
     // Find the segment
     dual_segment* segment = find_segment(region, source);
     if (unlikely(!segment)) {
+        printf("Segment not found\n");
         return false;
     }
 
     // Verify that we are not reading out of bounds
     size_t bytes_offset = (uint8_t*)source - segment->ro_words;
     size_t segment_size_bytes = segment->size * region->align;
-    if (unlikely(bytes_offset + size > segment_size_bytes)) {    
+    if (unlikely(bytes_offset + size > segment_size_bytes)) {
+        printf("Reading out of bounds\n");    
         return false;
     }
 
@@ -729,16 +661,17 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 
     // Read-only transactions can read from ro_words without locking
     if (transaction->is_ro) {
-        memcpy(target, segment->ro_words + bytes_offset, size);
+        memcpy(target, source, size);
     } else {
         // Read-write transactions need to lock all words for reading
         size_t num_words = max_word_index - min_word_index + 1;
         pthread_rwlock_t** acquired_locks = malloc(num_words * sizeof(pthread_rwlock_t*));
         if (!acquired_locks) {
+            printf("Failed to allocate memory for locks\n");
             return false;
         }
 
-        // Acquire read locks in order to prevent deadlocks
+        // Acquire read locks
         for (size_t i = min_word_index, lock_index = 0; i <= max_word_index; i++, lock_index++) {
             pthread_rwlock_t* rwlock = &(segment->controls[i].word_mutex);
             pthread_rwlock_rdlock(rwlock);
@@ -748,6 +681,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
             controls* ctrl = &segment->controls[i];
             if (ctrl->written_while_epoch && ctrl->owner != transaction) {
                 success = false;
+                //printf("%zu: Read onflict detected on word %zu\n", transaction->id, i);
                 break;
             }
         }
@@ -773,8 +707,9 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         free(acquired_locks);
     }
 
-    if (!success) {
-        return false;
+    if(!success) {
+        //printf("Read operation failed, rolling back transaction\n");
+        rollback_tx(region, transaction);
     }
     
     return success;
@@ -795,18 +730,21 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
 
     // Validate input parameters
     if (unlikely(size == 0 || size % region->align != 0)) {
+        printf("Write size is invalid\n");
         return false;
     }
 
     // Find the segment
     dual_segment* segment = find_segment(region, target);
     if (unlikely(!segment)) {
+        printf("Segment not found\n");
         return false;
     }
 
     // Verify that we are not writing out of bounds
     size_t bytes_offset = (uint8_t*)target - segment->ro_words;
     if (unlikely(bytes_offset + size > segment->size * region->align)) {
+        printf("Writing out of bounds\n");
         return false;
     }
 
@@ -815,9 +753,10 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     size_t max_word_index = (bytes_offset + size - 1) / word_size;
     size_t num_words = max_word_index - min_word_index + 1;
 
-    // Acquire write locks for all words involved
+    // Initialize an array to store the acquired locks
     pthread_rwlock_t** acquired_locks = malloc(num_words * sizeof(pthread_rwlock_t*));
     if (!acquired_locks) {
+        printf("Failed to allocate memory for locks\n");
         return false;
     }
 
@@ -834,24 +773,14 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         // Check for conflicts
         controls* ctrl = &segment->controls[i];
         if (ctrl->owner != NULL && ctrl->owner != transaction) {
-
-            // Detail about the current tx (undo log)
-            struct undo_log_entry* log_entry = transaction->undo_log_head;
-            while (log_entry != NULL) {
-                log_entry = log_entry->next;
-            }
-
-            // Detail about the owner tx (undo log)
-            log_entry = ((struct transaction*)ctrl->owner)->undo_log_head;
-            while (log_entry != NULL) {
-                log_entry = log_entry->next;
-            }
-
+            // Some other transaction has already written to this word
             conflict_detected = true;
+            //printf("%zu: Write conflict detected on word %zu\n", transaction->id, i);
             break;
         }
     }
 
+    // If a conflict was detected, release the locks and return false
     if (conflict_detected) {
         // Release locks
         for (size_t i = 0; i < num_words; i++) {
@@ -859,23 +788,11 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         }
         free(acquired_locks);
 
-        // Rollback changes
-        struct undo_log_entry* log_entry = transaction->undo_log_head;
-        while (log_entry != NULL) {
-            memcpy(log_entry->addr, log_entry->original_value, log_entry->size);
-            log_entry = log_entry->next;
-        }
+        //printf("Write operation failed, rolling back transaction\n");
 
-        // Free the undo log
-        log_entry = transaction->undo_log_head;
-        while (log_entry != NULL) {
-            struct undo_log_entry* temp = log_entry;
-            log_entry = log_entry->next;
-            free(temp->original_value);
-            free(temp);
-        }
-        transaction->undo_log_head = NULL;
-
+        // Rollback the transaction
+        rollback_tx(region, transaction);
+        
         return false;
     }
 
@@ -885,29 +802,6 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         size_t offset = i * word_size;
         controls* ctrl = &segment->controls[i];
 
-        // Check if this address is already in the undo log
-        bool already_logged = false;
-        struct undo_log_entry* log_entry = transaction->undo_log_head;
-        while (log_entry != NULL) {
-            if (log_entry->addr == (segment->rw_words + offset)) {
-                already_logged = true;
-                break;
-            }
-            log_entry = log_entry->next;
-        }
-
-        if (!already_logged) {
-            // Save the original value
-            struct undo_log_entry* new_entry = malloc(sizeof(struct undo_log_entry));
-
-            new_entry->addr = segment->rw_words + offset;
-            new_entry->size = word_size;
-            new_entry->original_value = malloc(word_size);
-            memcpy(new_entry->original_value, new_entry->addr, word_size);
-            new_entry->next = transaction->undo_log_head;
-            transaction->undo_log_head = new_entry;
-        }
-
         // Perform the write
         memcpy(segment->rw_words + offset, src_ptr, word_size);
         src_ptr += word_size;
@@ -915,6 +809,14 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         // Update control structures
         ctrl->owner = transaction;
         ctrl->written_while_epoch = true;
+
+        // Add the word to the undo log
+        struct undo_log_entry* new_entry = malloc(sizeof(struct undo_log_entry));
+        new_entry->addr = segment->rw_words + offset;
+        new_entry->original_value = malloc(word_size);
+        memcpy(new_entry->original_value, segment->ro_words + offset, word_size);
+        new_entry->next = transaction->undo_log_head;
+        transaction->undo_log_head = new_entry;
     }
 
     // Release locks
@@ -1089,4 +991,3 @@ bool tm_free(shared_t shared, tx_t tx, void* target) {
 
     return true;
 }
-
