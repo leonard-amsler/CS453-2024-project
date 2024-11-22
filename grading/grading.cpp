@@ -270,7 +270,7 @@ int main(int argc, char** argv) {
         }();
         auto const nbtxperwrk    = 200000ul / nbworkers;
         auto const nbaccounts    = 32 * nbworkers;
-        auto const expnbaccounts = 256 * nbworkers;
+        auto const expnbaccounts = 256 * nbworkers; // 8 times the number of accounts
         auto const init_balance  = 100ul;
         auto const prob_long     = 0.5f;
         auto const prob_alloc    = 0.01f;
