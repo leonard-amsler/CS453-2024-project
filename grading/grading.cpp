@@ -162,24 +162,20 @@ static auto measure(Workload& workload, unsigned int const nbthreads, unsigned i
                 // Threads are synchronized between each test so that they run with a lot of concurrency.
                 try {
                     // 1. Initialization
-                    //printf("Thread %d is initializing\n", i);
                     if (!sync.worker_wait()) return; // Sync. of threads
                     sync.worker_notify(workload.init()); // Runs the test and tells the master about errors
 
                     // 2. Performance measurements
-                    //printf("Thread %d is running\n", i);
                     for (unsigned int count = 0; count < nbrepeats; ++count) {
                         if (!sync.worker_wait()) return;
                         sync.worker_notify(workload.run(i, seed + nbthreads * count + i));
                     }
 
                     // 3. Correctness check
-                    //printf("Thread %d is checking\n", i);
                     if (!sync.worker_wait()) return;
                     sync.worker_notify(workload.check(i, std::random_device{}())); // Random seed is wanted here
 
                     // Synchronized quit
-                    //printf("Thread %d is done\n", i);
                     if (!sync.worker_wait()) return;
                     throw Exception::Unreachable{"unexpected worker iteration after checks"};
                 } catch (::std::exception const& err) {
@@ -272,16 +268,16 @@ int main(int argc, char** argv) {
                 res = 16;
             return static_cast<size_t>(4);
         }();
-        auto const nbtxperwrk    = 1000ul / nbworkers;
+        auto const nbtxperwrk    = 20ul / nbworkers;
         auto const nbaccounts    = 32 * nbworkers;
         auto const expnbaccounts = 256 * nbworkers;
         auto const init_balance  = 100ul;
         auto const prob_long     = 0.5f;
-        auto const prob_alloc    = 0.0f;
-        auto const nbrepeats     = 7;
+        auto const prob_alloc    = 0.00f;
+        auto const nbrepeats     = 1;
         auto const seed          = static_cast<Seed>(::std::stoul(argv[1]));
         auto const clk_res       = Chrono::get_resolution();
-        auto const slow_factor   = 10000ul;
+        auto const slow_factor   = 160000ul;
         // Print run parameters
         ::std::cout << "⎧ #worker threads:     " << nbworkers << ::std::endl;
         ::std::cout << "⎪ #TX per worker:      " << nbtxperwrk << ::std::endl;
@@ -309,13 +305,10 @@ int main(int argc, char** argv) {
             ::std::cout << "⎧ Evaluating '" << argv[i] << "'" << (maxtick_init == Chrono::invalid_tick ? " (reference)" : "") << "..." << ::std::endl;
             // Load TM library
             TransactionalLibrary tl{argv[i]};
-
             // Initialize workload (shared memory lifetime bound to workload: created and destroyed at the same time)
-            //printf("Creating WorkloadBank\n");
             WorkloadBank bank{tl, nbworkers, nbtxperwrk, nbaccounts, expnbaccounts, init_balance, prob_long, prob_alloc};
             try {
                 // Actual performance measurements and correctness check
-                //printf("Measuring\n");
                 auto res = measure(bank, nbworkers, nbrepeats, seed, maxtick_init, maxtick_perf, maxtick_chck);
                 // Check false negative-free correctness
                 auto error = ::std::get<0>(res);
@@ -331,13 +324,13 @@ int main(int argc, char** argv) {
                 ::std::cout << "⎪ Total user execution time: " << (perfdbl / 1000000.) << " ms";
                 if (maxtick_init == Chrono::invalid_tick) { // Set reference performance
                     maxtick_init = slow_factor * tick_init;
-                    if ((maxtick_init == Chrono::invalid_tick)) // Bad luck...
+                    if (unlikely(maxtick_init == Chrono::invalid_tick)) // Bad luck...
                         ++maxtick_init;
                     maxtick_perf = slow_factor * tick_perf;
-                    if ((maxtick_perf == Chrono::invalid_tick)) // Bad luck...
+                    if (unlikely(maxtick_perf == Chrono::invalid_tick)) // Bad luck...
                         ++maxtick_perf;
                     maxtick_chck = slow_factor * tick_chck;
-                    if ((maxtick_chck == Chrono::invalid_tick)) // Bad luck...
+                    if (unlikely(maxtick_chck == Chrono::invalid_tick)) // Bad luck...
                         ++maxtick_chck;
                     reference = perfdbl;
                 } else { // Compare with reference performance

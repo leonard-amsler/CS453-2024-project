@@ -177,11 +177,6 @@ private:
                 start = segment.next; // Accounts are stored in linked segments, we move to the next one.
             }
             nbaccounts = count;
-
-            if (sum != static_cast<Balance>(init_balance * count)) // Consistency check: no money should ever be destroyed or created out of thin air.
-                printf("sum: %ld, init_balance: %ld, count: %ld\n", sum, init_balance, count);
-            
-
             return sum == static_cast<Balance>(init_balance * count); // Consistency check: no money should ever be destroyed or created out of thin air.
         });
     }
@@ -271,7 +266,6 @@ private:
             Shared<Balance> sender{tx, send_ptr}; // Shared is a template that overloads copy to use tm_read/tm_write.
             Shared<Balance> recver{tx, recv_ptr};
             auto send_val = sender.read();
-            printf("send_val: %ld from account %ld to account %ld\n", send_val, send_id, recv_id);
             if (send_val > 0) {
                 sender = send_val - 1;
                 recver = recver.read() + 1;
@@ -288,8 +282,8 @@ public:
             AccountSegment segment{tx, tm.get_start()};
             segment.count = nbaccounts;
             for (size_t i = 0; i < nbaccounts; ++i){
-                //printf("init_balance: %ld for account %ld\n", init_balance, i);
-                segment.accounts[i] = init_balance;}
+                segment.accounts[i] = init_balance;
+            }
         });
         auto correct = transactional(tm, Transaction::Mode::read_only, [&](Transaction& tx) {
             AccountSegment segment{tx, tm.get_start()};
@@ -312,26 +306,19 @@ public:
         size_t count = nbaccounts;
         for (size_t cntr = 0; cntr < nbtxperwrk; ++cntr) {
             if (long_dist(engine)) { // We roll a dice and, if "lucky", run a long transaction.
-                //printf("long_tx\n");
-                if (unlikely(!long_tx(count))) {// If it fails, then we return an error message.
-                    printf("long tx failed\n");
+                if (unlikely(!long_tx(count))) // If it fails, then we return an error message.
                     return "Violated isolation or atomicity";
-                }
             } else if (alloc_dist(engine)) { // Let's roll a dice again to trigger an allocation transaction.
-                //printf("alloc_tx\n");
                 alloc_tx(alloc_trigger(engine));
             } else { // No luck with previous rolls, let's just run a short transaction.
-                //printf("short_tx\n");
                 ::std::uniform_int_distribution<size_t> account{0, count - 1};
                 while (unlikely(!short_tx(account(engine), account(engine))));
             }
         }
         { // Last long transaction
             size_t dummy;
-            if (!long_tx(dummy)){
-                printf("dummy long tx failed\n");
+            if (!long_tx(dummy))
                 return "Violated isolation or atomicity";
-            }
         }
         return nullptr;
     }
@@ -344,14 +331,12 @@ public:
 
         barrier.sync();
         if (uid == 0) { // Only the first thread initializes the shared memory.
-            //printf("First thread is initializing\n");
             // We first write the initial value,
             auto init_counter = nbtxperwrk * nbworkers;
             transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {
                 Shared<size_t> counter{tx, tm.get_start()};
                 counter = init_counter;
             });
-            //printf("init_counter: %ld\n", init_counter);
 
             // And check in another transaction that it was written correctly.
             auto correct = transactional(tm, Transaction::Mode::read_only, [&](Transaction& tx) {
@@ -374,7 +359,6 @@ public:
                 Shared<size_t> counter{tx, tm.get_start()};
                 return counter.read();
             });
-            //printf("last: %ld\n", last);
 
             // And then we decrease the value of the counter after checking that it didn't increase since the last read.
             auto correct = transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {
