@@ -273,7 +273,7 @@ int main(int argc, char** argv) {
         auto const expnbaccounts = 256 * nbworkers;
         auto const init_balance  = 100ul;
         auto const prob_long     = 0.5f;
-        auto const prob_alloc    = 0.00f;
+        auto const prob_alloc    = 0.01f;
         auto const nbrepeats     = 7;
         auto const seed          = static_cast<Seed>(::std::stoul(argv[1]));
         auto const clk_res       = Chrono::get_resolution();
