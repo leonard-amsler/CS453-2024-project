@@ -836,19 +836,19 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-alloc_t tm_alloc(shared_t shared, unused(tx_t tx), size_t size, void** target) {
+alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
     struct region* region = (struct region*)shared;
+    struct transaction* transaction = (struct transaction*)tx;
+
+    printf("Transaction %zu is trying to allocate a new segment of %zu bytes\n", transaction->id, size);
 
     // Validate input parameters
     if (unlikely(size == 0 || size % region->align != 0)) {
-        // The length 'size' must be a positive multiple of the alignment
-        // Behavior is undefined; returning abort_alloc as per guidelines
         return abort_alloc;
     }
 
     // Check that size is at most 2^48
     if (unlikely(size > ((size_t)1 << 48))) {
-        // Size exceeds maximum allowed value
         return nomem_alloc;
     }
 
@@ -858,82 +858,67 @@ alloc_t tm_alloc(shared_t shared, unused(tx_t tx), size_t size, void** target) {
         return nomem_alloc;
     }
 
-    // Calculate the number of words
     size_t word_size = region->align;
     size_t num_words = size / word_size;
-    segment->size = num_words;  // Number of words in the segment
+    segment->size = num_words; // Number of words in the segment
 
-    // Set can_be_freed to true (new segments can be freed)
-    segment->can_be_freed = true;
-
-    // Initialize next pointer
-    segment->next = NULL;
-
-    // Allocate memory for ro_words
-    segment->ro_words = (uint8_t*)malloc(size);
-    if (unlikely(!segment->ro_words)) {
+    // Allocate ro_words
+    if (unlikely(posix_memalign((void**)&(segment->ro_words), region->align, size) != 0)) {
         free(segment);
+        pthread_mutex_destroy(&(region->segments_mutex));
         return nomem_alloc;
     }
 
-    // Allocate memory for rw_words
-    segment->rw_words = (uint8_t*)malloc(size);
-    if (unlikely(!segment->rw_words)) {
+    // Allocate rw_words
+    if (unlikely(posix_memalign((void**)&(segment->rw_words), region->align, size) != 0)) {
         free(segment->ro_words);
         free(segment);
+        pthread_mutex_destroy(&(region->segments_mutex));
         return nomem_alloc;
     }
 
-    // Allocate memory for controls array
-    segment->controls = (controls*)malloc(num_words * sizeof(controls));
+    // Initialize ro_words and rw_words to zero
+    memset(segment->ro_words, 0, size);
+    memset(segment->rw_words, 0, size);
+
+    // Allocate controls array
+    segment->controls = malloc(num_words * sizeof(controls));
     if (unlikely(!segment->controls)) {
         free(segment->rw_words);
         free(segment->ro_words);
         free(segment);
+        pthread_mutex_destroy(&(region->segments_mutex));
         return nomem_alloc;
     }
 
-    // Initialize the copies to zeroes
-    memset(segment->ro_words, 0, size);
-    memset(segment->rw_words, 0, size);
-
-    // Initialize the control structures
+    // Initialize the controls array
     for (size_t i = 0; i < num_words; i++) {
-        // Initialize the mutex
-        pthread_mutex_init(&segment->controls[i].word_mutex, NULL);
-
-        // Initialize other fields
         segment->controls[i].written_while_epoch = false;
         segment->controls[i].owner = NULL;
+        if (unlikely(pthread_rwlock_init(&(segment->controls[i].word_mutex), NULL) != 0)) {
+            // Clean up resources allocated so far
+            for (size_t j = 0; j < i; j++) {
+                pthread_rwlock_destroy(&(segment->controls[j].word_mutex));
+            }
+            free(segment->controls);
+            free(segment->rw_words);
+            free(segment->ro_words);
+            free(segment);
+            pthread_mutex_destroy(&(region->segments_mutex));
+            return nomem_alloc;
+        }
     }
 
-    // Register the segment in the set of allocated segments
-    pthread_mutex_lock(&region->segments_mutex);
-
-    // Add the segment to the head of the linked list
+    // Add the segment to the region's segment list
+    pthread_mutex_lock(&(region->segments_mutex));
     segment->next = region->segment_head;
     region->segment_head = segment;
+    pthread_mutex_unlock(&(region->segments_mutex));
 
-    pthread_mutex_unlock(&region->segments_mutex);
+    *target = segment->ro_words;
 
-    // Set *target to the starting address of the segment's read-only words
-    *target = (void*)segment->ro_words;
-
-    // Ensure that *target is not NULL
-    if (unlikely(*target == NULL)) {
-        // This should not happen, but handle it just in case
-        // Clean up resources
-        for (size_t i = 0; i < num_words; i++) {
-            pthread_mutex_destroy(&segment->controls[i].word_mutex);
-        }
-        free(segment->controls);
-        free(segment->rw_words);
-        free(segment->ro_words);
-        free(segment);
-        return nomem_alloc;
-    }
-
-    return success_alloc;  // Allocation was successful
+    printf("Transaction %zu successfully allocated a new segment!\n", transaction->id);
+    return success_alloc;
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
