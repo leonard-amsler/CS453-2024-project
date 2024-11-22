@@ -87,15 +87,12 @@ struct transaction {
 // -------------------------------------------- HELPER FUNCTIONS --------------------------------------------
 
 dual_segment* find_segment(struct region* region, const void* addr) {
-
-    dual_segment* current = region->segment_head;
-    while (current) {
-        void* start = current->ro_words;
-        void* end = start + current->size * region->align;
-        if (addr >= start && addr < end) {
-            return current;
+    dual_segment* current_segment = region->segment_head;
+    while (current_segment) {
+        if ((addr >= current_segment->ro_words) && (addr < current_segment->ro_words + current_segment->size * region->align)) {
+            return current_segment;
         }
-        current = current->next;
+        current_segment = current_segment->next;
     }
     return NULL;
 }
@@ -107,10 +104,13 @@ dual_segment* find_segment(struct region* region, const void* addr) {
  */
 void rollback_tx(struct region* region, struct transaction* tx) {
 
+    //printf("Rolling back transaction %zu\n", tx->id);
+
     // Iterate over the undo log and restore the original values
     if (!tx->is_ro) {
         struct undo_log_entry* log_entry = tx->undo_log_head;
         while (log_entry != NULL) {
+            //printf("Restoring word at address %p to %p\n", log_entry->addr, log_entry->original_value);
             uint8_t* addr = log_entry->addr;
             memcpy(addr, log_entry->original_value, region->align);
             log_entry = log_entry->next;
@@ -332,6 +332,7 @@ shared_t tm_create(size_t size, size_t align) {
     region->batcher->remaining = 0;
     region->batcher->blocked_count = 0;
     region->batcher->wake_up_threads_only = false;
+    atomic_init(&(region->batcher->current_tx_id), 0);
 
     if (unlikely(pthread_mutex_init(&(region->batcher->batcher_mutex), NULL) != 0)) {
         free(region->batcher);
@@ -532,6 +533,9 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
         }
     }
 
+    //printf("Transaction %zu passed the batcher\n", tx->id);
+    //printf("    START %zu: Remaining: %d, Blocked: %d, Wake Up Only: %s\n", tx->id, batcher->remaining, batcher->blocked_count, batcher->wake_up_threads_only ? "true" : "false");
+
     pthread_mutex_unlock(&(batcher->batcher_mutex));
 
     if (should_broadcast_enter) {
@@ -593,6 +597,9 @@ bool tm_end(shared_t shared, tx_t tx) {
         }
 
     }
+
+    //printf("    END %zu: Remaining: %d, Blocked: %d, Wake Up Only: %s\n", transaction->id, batcher->remaining, batcher->blocked_count, batcher->wake_up_threads_only ? "true" : "false");
+
 
     pthread_mutex_unlock(&(batcher->batcher_mutex));
 
@@ -671,10 +678,14 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         }
 
         // Acquire read locks
-        for (size_t i = min_word_index, lock_index = 0; i <= max_word_index; i++, lock_index++) {
+        size_t lock_index = 0;
+        for (size_t i = min_word_index; i <= max_word_index; i++) {
             pthread_rwlock_t* rwlock = &(segment->controls[i].word_mutex);
+            //printf("   RTX %zu: Trying to acquire read lock on word %zu\n", transaction->id, i);
             pthread_rwlock_rdlock(rwlock);
+            //printf("   RTX %zu: Acquired read lock on word %zu\n", transaction->id, i);
             acquired_locks[lock_index] = rwlock;
+            lock_index++;
 
             // Check for conflicts
             controls* ctrl = &segment->controls[i];
@@ -700,7 +711,8 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         }
 
         // Release locks
-        for (size_t i = 0; i < (max_word_index - min_word_index + 1); i++) {
+        for (size_t i = 0; i < lock_index; i++) {
+            //printf("   RTX %zu: Releasing read lock on word %zu\n", transaction->id, min_word_index + i);
             pthread_rwlock_unlock(acquired_locks[i]);
         }
         free(acquired_locks);
@@ -763,11 +775,15 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     bool conflict_detected = false;
 
     // Acquire write locks in order to prevent deadlocks
-    for (size_t i = min_word_index, lock_index = 0; i <= max_word_index; i++, lock_index++) {
+    size_t lock_index = 0;
+    for (size_t i = min_word_index; i <= max_word_index; i++) {
         pthread_rwlock_t* rwlock = &(segment->controls[i].word_mutex);
+        //printf("   WTX %zu: Trying to acquire write lock on word %zu\n", transaction->id, i);
         pthread_rwlock_wrlock(rwlock);
+        //printf("   WTX %zu: Acquired write lock on word %zu\n", transaction->id, i);
 
         acquired_locks[lock_index] = rwlock;
+        lock_index++;
 
         // Check for conflicts
         controls* ctrl = &segment->controls[i];
@@ -782,7 +798,8 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     // If a conflict was detected, release the locks and return false
     if (conflict_detected) {
         // Release locks
-        for (size_t i = 0; i < num_words; i++) {
+        for (size_t i = 0; i < lock_index; i++) {
+            //printf("   WTX %zu: Releasing write lock on word %zu\n", transaction->id, min_word_index + i);
             pthread_rwlock_unlock(acquired_locks[i]);
         }
         free(acquired_locks);
@@ -820,6 +837,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
 
     // Release locks
     for (size_t i = 0; i < num_words; i++) {
+        //printf("   WTX %zu: Releasing write lock on word %zu\n", transaction->id, min_word_index + i);
         pthread_rwlock_unlock(acquired_locks[i]);
     }
     free(acquired_locks);
@@ -835,38 +853,40 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
+alloc_t tm_alloc(shared_t shared, unused(tx_t tx), size_t size, void** target) {
     struct region* region = (struct region*)shared;
-    struct transaction* transaction = (struct transaction*)tx;
-
-    printf("Transaction %zu is trying to allocate a new segment of %zu bytes\n", transaction->id, size);
 
     // Validate input parameters
     if (unlikely(size == 0 || size % region->align != 0)) {
-        print("Allocation size is invalid\n");
+        printf("Allocation size is invalid\n");
         return abort_alloc;
     }
 
     // Check that size is at most 2^48
     if (unlikely(size > ((size_t)1 << 48))) {
-        print("Allocation size is too large\n");
+        printf("Allocation size is too large\n");
         return abort_alloc;
     }
 
     // Allocate the dual_segment structure
     dual_segment* segment = (dual_segment*)malloc(sizeof(dual_segment));
     if (unlikely(!segment)) {
-        print("Failed to allocate memory for the segment\n");
+        printf("Failed to allocate memory for the segment\n");
         return nomem_alloc;
     }
 
+    // Initialize the segment
+    segment->can_be_freed = true;
+    segment->next = NULL;
+
+    // Calculate the number of words
     size_t word_size = region->align;
     size_t num_words = size / word_size;
     segment->size = num_words; // Number of words in the segment
 
     // Allocate ro_words
     if (unlikely(posix_memalign((void**)&(segment->ro_words), region->align, size) != 0)) {
-        print("Failed to allocate memory for ro_words\n");
+        printf("Failed to allocate memory for ro_words\n");
         free(segment);
         pthread_mutex_destroy(&(region->segments_mutex));
         return nomem_alloc;
@@ -874,7 +894,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
 
     // Allocate rw_words
     if (unlikely(posix_memalign((void**)&(segment->rw_words), region->align, size) != 0)) {
-        print("Failed to allocate memory for rw_words\n");
+        printf("Failed to allocate memory for rw_words\n");
         free(segment->ro_words);
         free(segment);
         pthread_mutex_destroy(&(region->segments_mutex));
@@ -888,7 +908,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
     // Allocate controls array
     segment->controls = malloc(num_words * sizeof(controls));
     if (unlikely(!segment->controls)) {
-        print("Failed to allocate memory for controls\n");
+        printf("Failed to allocate memory for controls\n");
         free(segment->rw_words);
         free(segment->ro_words);
         free(segment);
@@ -901,7 +921,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
         segment->controls[i].written_while_epoch = false;
         segment->controls[i].owner = NULL;
         if (unlikely(pthread_rwlock_init(&(segment->controls[i].word_mutex), NULL) != 0)) {
-            print("Failed to initialize a word mutex\n");
+            printf("Failed to initialize a word mutex\n");
             // Clean up resources allocated so far
             for (size_t j = 0; j < i; j++) {
                 pthread_rwlock_destroy(&(segment->controls[j].word_mutex));
@@ -919,18 +939,21 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
     pthread_mutex_lock(&(region->segments_mutex));
 
     size_t num_segments = 1;
-    dual_segment* current = region->segment_head;
-    while (current->next) {
-        num_segments++;
-        current = current->next;
+    if (region->segment_head == NULL) {
+        region->segment_head = segment;
+    } else {
+        dual_segment* current = region->segment_head;
+        while (current->next) {
+            num_segments++;
+            current = current->next;
+        }
+        current->next = segment;
     }
-    current->next = segment;
 
     pthread_mutex_unlock(&(region->segments_mutex));
 
     *target = segment->ro_words;
-
-    printf("Transaction %zu successfully allocated a new segment (nb: %zu)\n", transaction->id, num_segments);
+    
     return success_alloc;
 }
 
@@ -940,11 +963,8 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
 **/
-bool tm_free(shared_t shared, tx_t tx, void* target) {
+bool tm_free(shared_t shared, unused(tx_t tx), void* target) {
     struct region* region = (struct region*)shared;
-    struct transaction* transaction = (struct transaction*)tx;
-
-    printf("Transaction %zu is trying to free a segment at address %p\n", transaction->id, target);
 
     // Find the segment
     dual_segment* segment = find_segment(region, target);
@@ -992,6 +1012,5 @@ bool tm_free(shared_t shared, tx_t tx, void* target) {
     // Free the segment itself
     free(segment);
 
-    printf("Transaction %zu successfully freed the segment\n", transaction->id);
     return true;
 }
