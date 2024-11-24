@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
             auto res = ::std::thread::hardware_concurrency();
             if (unlikely(res == 0))
                 res = 16;
-            return static_cast<size_t>(res);
+            return static_cast<size_t>(8);
         }();
         auto const nbtxperwrk    = 200000ul / nbworkers;
         auto const nbaccounts    = 32 * nbworkers;
@@ -274,7 +274,7 @@ int main(int argc, char** argv) {
         auto const init_balance  = 100ul;
         auto const prob_long     = 0.5f;
         auto const prob_alloc    = 0.01f;
-        auto const nbrepeats     = 2;
+        auto const nbrepeats     = 7;
         auto const seed          = static_cast<Seed>(::std::stoul(argv[1]));
         auto const clk_res       = Chrono::get_resolution();
         auto const slow_factor   = 100ul;
