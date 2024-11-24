@@ -94,6 +94,7 @@ dual_segment* find_segment(struct region* region, const void* addr) {
         }
         current_segment = current_segment->next;
     }
+
     return NULL;
 }
 
@@ -478,7 +479,9 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     // Assign transaction properties
     tx->is_ro = is_ro;
     tx->undo_log_head = NULL;
-    tx->id = __sync_fetch_and_add(&(region->batcher->current_tx_id), 1);
+    tx->id = atomic_fetch_add_explicit(&(region->batcher->current_tx_id), 1, memory_order_relaxed);
+
+
 
     // Variables to determine whether to broadcast
     bool should_broadcast_enter = false;
@@ -641,13 +644,15 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     // Validate input parameters
     if (unlikely(size == 0 || size % region->align != 0)) {
         printf("Read size is invalid\n");
+        rollback_tx(region, transaction);
         return false;
     }
 
     // Find the segment
     dual_segment* segment = find_segment(region, source);
     if (unlikely(!segment)) {
-        printf("Segment not found\n");
+        //printf("READ Segment not found\n");
+        rollback_tx(region, transaction);
         return false;
     }
 
@@ -656,6 +661,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     size_t segment_size_bytes = segment->size * region->align;
     if (unlikely(bytes_offset + size > segment_size_bytes)) {
         printf("Reading out of bounds\n");    
+        rollback_tx(region, transaction);
         return false;
     }
 
@@ -663,17 +669,27 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     size_t min_word_index = bytes_offset / word_size;
     size_t max_word_index = (bytes_offset + size - 1) / word_size;
 
+    if (max_word_index - min_word_index > 1) {
+        printf("Reading across %zu words\n", max_word_index - min_word_index);
+    }
+
     bool success = true;
 
     // Read-only transactions can read from ro_words without locking
     if (transaction->is_ro) {
-        memcpy(target, source, size);
+        uint8_t* dst_ptr = (uint8_t*)target;
+        for (size_t i = min_word_index; i <= max_word_index; ++i) {
+            uint8_t* src_ptr = segment->ro_words + i * word_size;
+            memcpy(dst_ptr, src_ptr, word_size);
+            dst_ptr += word_size;
+        }
     } else {
         // Read-write transactions need to lock all words for reading
         size_t num_words = max_word_index - min_word_index + 1;
         pthread_rwlock_t** acquired_locks = malloc(num_words * sizeof(pthread_rwlock_t*));
         if (!acquired_locks) {
             printf("Failed to allocate memory for locks\n");
+            rollback_tx(region, transaction);
             return false;
         }
 
@@ -742,13 +758,15 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     // Validate input parameters
     if (unlikely(size == 0 || size % region->align != 0)) {
         printf("Write size is invalid\n");
+        rollback_tx(region, transaction);
         return false;
     }
 
     // Find the segment
     dual_segment* segment = find_segment(region, target);
     if (unlikely(!segment)) {
-        printf("Segment not found\n");
+        printf("WRITE Segment not found\n");
+        rollback_tx(region, transaction);
         return false;
     }
 
@@ -756,6 +774,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     size_t bytes_offset = (uint8_t*)target - segment->ro_words;
     if (unlikely(bytes_offset + size > segment->size * region->align)) {
         printf("Writing out of bounds\n");
+        rollback_tx(region, transaction);
         return false;
     }
 
@@ -768,6 +787,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     pthread_rwlock_t** acquired_locks = malloc(num_words * sizeof(pthread_rwlock_t*));
     if (!acquired_locks) {
         printf("Failed to allocate memory for locks\n");
+        rollback_tx(region, transaction);
         return false;
     }
 
@@ -859,12 +879,14 @@ alloc_t tm_alloc(shared_t shared, unused(tx_t tx), size_t size, void** target) {
     // Validate input parameters
     if (unlikely(size == 0 || size % region->align != 0)) {
         printf("Allocation size is invalid\n");
+        rollback_tx(region, (struct transaction*)tx);
         return abort_alloc;
     }
 
     // Check that size is at most 2^48
     if (unlikely(size > ((size_t)1 << 48))) {
         printf("Allocation size is too large\n");
+        rollback_tx(region, (struct transaction*)tx);
         return abort_alloc;
     }
 
@@ -888,7 +910,6 @@ alloc_t tm_alloc(shared_t shared, unused(tx_t tx), size_t size, void** target) {
     if (unlikely(posix_memalign((void**)&(segment->ro_words), region->align, size) != 0)) {
         printf("Failed to allocate memory for ro_words\n");
         free(segment);
-        pthread_mutex_destroy(&(region->segments_mutex));
         return nomem_alloc;
     }
 
@@ -897,7 +918,6 @@ alloc_t tm_alloc(shared_t shared, unused(tx_t tx), size_t size, void** target) {
         printf("Failed to allocate memory for rw_words\n");
         free(segment->ro_words);
         free(segment);
-        pthread_mutex_destroy(&(region->segments_mutex));
         return nomem_alloc;
     }
 
@@ -912,7 +932,6 @@ alloc_t tm_alloc(shared_t shared, unused(tx_t tx), size_t size, void** target) {
         free(segment->rw_words);
         free(segment->ro_words);
         free(segment);
-        pthread_mutex_destroy(&(region->segments_mutex));
         return nomem_alloc;
     }
 
@@ -930,7 +949,7 @@ alloc_t tm_alloc(shared_t shared, unused(tx_t tx), size_t size, void** target) {
             free(segment->rw_words);
             free(segment->ro_words);
             free(segment);
-            pthread_mutex_destroy(&(region->segments_mutex));
+            rollback_tx(region, (struct transaction*)tx);
             return nomem_alloc;
         }
     }
@@ -966,16 +985,20 @@ alloc_t tm_alloc(shared_t shared, unused(tx_t tx), size_t size, void** target) {
 bool tm_free(shared_t shared, unused(tx_t tx), void* target) {
     struct region* region = (struct region*)shared;
 
+    //printf("Freeing segment at address %p\n", target);
+
     // Find the segment
     dual_segment* segment = find_segment(region, target);
     if (unlikely(!segment)) {
-        printf("Segment not found\n");
+        printf("FREE: Segment not found\n");
+        rollback_tx(region, (struct transaction*)tx);
         return false;
     }
 
     // Check if the segment can be freed
     if (!segment->can_be_freed) {
         printf("Segment cannot be freed\n");
+        rollback_tx(region, (struct transaction*)tx);
         return false;
     }
 
