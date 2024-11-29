@@ -275,7 +275,7 @@ int main(int argc, char** argv) {
         auto const prob_long     = 0.5f;
         auto const prob_alloc    = 0.01f;
         auto const nbrepeats     = 7;
-        auto const seed          = static_cast<Seed>(::std::stoul(argv[1]));
+        auto const seed          = 537;
         auto const clk_res       = Chrono::get_resolution();
         auto const slow_factor   = 16ul;
         // Print run parameters
