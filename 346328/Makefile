@@ -7,8 +7,6 @@ EXT_CXX  := C cc cpp cxx c++
 
 INCLUDE_DIR := ../include
 SOURCE_DIR  := .
-TEST_SRC := ./tests/tm_test.c 
-UNIT_TEST_SRC := ./tests/unit_tests.c  
 
 WILD_EXT  = $(strip $(foreach EXT,$($(1)),$(wildcard $(2)/*.$(EXT))))
 
@@ -18,16 +16,10 @@ SRCS_C   := $(call WILD_EXT,EXT_C,$(SOURCE_DIR))
 SRCS_CXX := $(call WILD_EXT,EXT_CXX,$(SOURCE_DIR))
 OBJS     := $(SRCS_C:%=%.o) $(SRCS_CXX:%=%.o)
 
-# Test-related settings
-TEST_OBJ := $(TEST_SRC:.c=.o)
-TEST_EXEC := tm_test
-UNIT_TEST_OBJ := $(UNIT_TEST_SRC:.c=.o)
-UNIT_TEST_EXEC := unit_tests
-
 CC       := $(CC)
-CCFLAGS  := -Wall -Wextra -Wfatal-errors -O2 -std=c11 -fPIC -I$(INCLUDE_DIR)
+CCFLAGS  := -Wall -Wextra -Wfatal-errors -Ofast -march=native -funroll-loops -std=c11 -fPIC -I$(INCLUDE_DIR)
 CXX      := $(CXX)
-CXXFLAGS := -Wall -Wextra -Wfatal-errors -O2 -std=c++17 -fPIC -I$(INCLUDE_DIR)
+CXXFLAGS := -Wall -Wextra -Wfatal-errors -Ofast -march=native -funroll-loops -std=c++17 -fPIC -I$(INCLUDE_DIR)
 LD       := $(if $(SRCS_CXX),$(CXX),$(CC))
 LDFLAGS  := -shared
 LDLIBS   := -lm -lpthread
@@ -35,10 +27,10 @@ LDLIBS   := -lm -lpthread
 .PHONY: build clean run_test
 
 #build: $(BIN) $(TEST_EXEC) $(UNIT_TEST_EXEC) 
-build: $(BIN) $(TEST_EXEC) 
+build: $(BIN) 
 
 clean:
-	$(RM) $(OBJS) $(BIN) $(TEST_OBJ) $(TEST_EXEC) $(UNIT_TEST_OBJ) $(UNIT_TEST_EXEC)
+	$(RM) $(OBJS) $(BIN)
 
 define BUILD_C
 %.$(1).o: %.$(1) $$(HDRS_C) Makefile
@@ -54,23 +46,3 @@ $(foreach EXT,$(EXT_CXX),$(eval $(call BUILD_CXX,$(EXT))))
 
 $(BIN): $(OBJS) Makefile
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
-
-# Compile and link tm_test.c
-$(TEST_OBJ): $(TEST_SRC) $(HDRS_C)
-	$(CC) $(CCFLAGS) -c -o $@ $<
-
-$(TEST_EXEC): $(TEST_OBJ) $(OBJS)
-	$(CC) $(CCFLAGS) -o $@ $(TEST_OBJ) $(OBJS) $(LDLIBS)
-
-run_test: $(TEST_EXEC)
-	./$(TEST_EXEC)
-
-# Compile and link unit_tests.c
-$(UNIT_TEST_OBJ): $(UNIT_TEST_SRC) $(HDRS_C)
-	$(CC) $(CCFLAGS) -c -o $@ $<
-
-$(UNIT_TEST_EXEC): $(UNIT_TEST_OBJ) $(OBJS)
-	$(CC) $(CCFLAGS) -o $@ $(UNIT_TEST_OBJ) $(OBJS) $(LDLIBS)
-
-run_unit_test: $(UNIT_TEST_EXEC)
-	./$(UNIT_TEST_EXEC)
